@@ -1,79 +1,81 @@
 # Star Citizen Hauling Monitor
 
-Ferramenta de monitoramento de missões de transporte (Hauling) para Star Citizen. Esta aplicação lê o arquivo de log do jogo em tempo real (`Game.log`) para rastrear missões aceitas, atualizações de carga, entregas e recompensas, exibindo tudo em um Dashboard Web interativo.
+Hauling mission monitoring tool for Star Citizen. This application reads the game log file in real-time (`Game.log`) to track accepted missions, cargo updates, deliveries, and rewards, displaying everything on an interactive Web Dashboard.
 
-## 🚀 Funcionalidades
+*Note: Reading the Log presents significant challenges as it is not a formal API that provides structured information. This can cause failures or missing information regarding cargo delivery, especially if log formats change with game version updates. Additionally, since the universe mapping is extensive and requires refinement, we have focused testing on specific sectors, which may result in missing data for other areas. Expanding this mapping is a key area for future improvement.*
 
--   **Rastreamento Automático**: Detecta missões de Hauling aceitas, coleta de carga e entregas diretamente do log do jogo.
--   **Dashboard Web**: Interface visual moderna e responsiva (Dark Mode) para acompanhar suas missões em um segundo monitor, tablet ou celular.
--   **Multi-Idioma**: Suporte completo para Português (PT) e Inglês (EN), configurável via arquivo JSON.
--   **Edição Manual**: Permite adicionar itens manualmente caso o log não capture algum evento ou para missões antigas.
--   **Histórico de Missões**: Salva missões concluídas, canceladas ou falhas, com cálculo de ganhos totais e tempo de missão.
--   **Persistência**: O estado atual é salvo automaticamente (`hauling_state.json`), permitindo fechar e reabrir a ferramenta sem perder o progresso.
--   **Identificação**: Detecta automaticamente o nome do jogador e a nave utilizada.
+## 🚀 Features
 
-## 🛠️ Instalação e Execução
+-   **Automatic Tracking**: Detects accepted Hauling missions, cargo pickup, and deliveries directly from the game log.
+-   **Web Dashboard**: Modern and responsive visual interface (Dark Mode) to track your missions on a second monitor, tablet, or phone.
+-   **Multi-Language**: Full support for Portuguese (PT) and English (EN), configurable via JSON file.
+-   **Manual Editing**: Allows manual addition of items if the log fails to capture an event or for older missions.
+-   **Mission History**: Saves completed, abandoned, or failed missions, with calculations for total earnings and mission time.
+-   **Persistence**: Current state is automatically saved (`hauling_state.json`), allowing you to close and reopen the tool without losing progress.
+-   **Identification**: Automatically detects the player name and ship used.
 
-### Pré-requisitos
--   Python 3.8 ou superior instalado.
--   Bibliotecas Python necessárias (instale via pip):
+## 🛠️ Installation and Execution
+
+### Prerequisites
+-   Python 3.8 or higher installed.
+-   Required Python libraries (install via pip):
     ```bash
     pip install flask
     ```
 
-### Como Rodar
-1.  Clone este repositório.
-2.  Verifique o caminho do seu arquivo de log no `hauling_config.json` (veja a seção de Configuração abaixo).
-3.  Execute o script principal:
+### How to Run
+1.  Clone this repository.
+2.  Check your log file path in `hauling_config.json` (see Configuration section below).
+3.  Run the main script:
     ```bash
     python hauling_web_tst.py
     ```
-4.  Abra o navegador no endereço indicado (geralmente `http://0.0.0.0:5000` ou `http://localhost:5000`).
+4.  Open your browser at the indicated address (usually `http://0.0.0.0:5000` or `http://localhost:5000`).
 
-## ⚙️ Configuração (`hauling_config.json`)
+## ⚙️ Configuration (`hauling_config.json`)
 
-O arquivo `hauling_config.json` controla o comportamento da ferramenta. As principais opções são:
+The `hauling_config.json` file controls the tool's behavior. The main options are:
 
-*   `"log_path"`: Caminho absoluto para o arquivo `Game.log` do Star Citizen.
-    *   Exemplo: `"C:/Program Files/Roberts Space Industries/StarCitizen/LIVE/Game.log"`
-*   `"language"`: Define o idioma da interface (`"pt"` para Português, `"en"` para Inglês).
-*   `"web_port"`: Porta para o servidor web (padrão: `5000`).
-*   `"refresh_interval_ms"`: Intervalo de atualização da página em milissegundos (padrão: `2000`).
+*   `"log_path"`: Absolute path to the Star Citizen `Game.log` file.
+    *   Example: `"C:/Program Files/Roberts Space Industries/StarCitizen/LIVE/Game.log"`
+*   `"language"`: Defines the interface language (`"pt"` for Portuguese, `"en"` for English).
+*   `"web_port"`: Port for the web server (default: `5000`).
+*   `"refresh_interval_ms"`: Page refresh interval in milliseconds (default: `2000`).
 
-## 🌍 Tradução e Internacionalização
+## 🌍 Translation and Internationalization
 
-O sistema de tradução é baseado em arquivos JSON. Para alterar o idioma ou adicionar um novo:
+The translation system is based on JSON files. To change the language or add a new one:
 
-1.  Edite o parâmetro `"language"` em `hauling_config.json`.
-2.  Certifique-se de que existe um arquivo correspondente `hauling_lang_{LANGUAGE}.json` (ex: `hauling_lang_pt.json`).
-3.  **Para contribuir com um novo idioma**:
-    *   Copie o arquivo `hauling_lang_en.json`.
-    *   Renomeie para `hauling_lang_fr.json` (por exemplo, para Francês).
-    *   Traduza os valores das chaves (não altere as chaves!).
-    *   Envie um Pull Request!
+1.  Edit the `"language"` parameter in `hauling_config.json`.
+2.  Ensure a corresponding `hauling_lang_{LANGUAGE}.json` file exists (e.g., `hauling_lang_en.json`).
+3.  **To contribute a new language**:
+    *   Copy the `hauling_lang_en.json` file.
+    *   Rename it to `hauling_lang_fr.json` (e.g., for French).
+    *   Translate the key values (do not change the keys!).
+    *   Submit a Pull Request!
 
-## 🤝 Como Contribuir
+## 🤝 How to Contribute
 
-Contribuições são bem-vindas! Se você quiser melhorar o código, adicionar funcionalidades ou corrigir bugs:
+Contributions are welcome! If you want to improve the code, add features, or fix bugs:
 
-1.  Faça um **Fork** do projeto.
-2.  Crie uma **Branch** para sua feature (`git checkout -b feature/nova-feature`).
-3.  Faça o **Commit** das suas alterações (`git commit -m 'Adiciona nova feature'`).
-4.  Faça o **Push** para a Branch (`git push origin feature/nova-feature`).
-5.  Abra um **Pull Request**.
+1.  **Fork** the project.
+2.  Create a **Branch** for your feature (`git checkout -b feature/new-feature`).
+3.  **Commit** your changes (`git commit -m 'Add new feature'`).
+4.  **Push** to the Branch (`git push origin feature/new-feature`).
+5.  Open a **Pull Request**.
 
-### Áreas para Melhoria
-*   Refinamento das Regex para capturar mais variações de logs de missões.
-*   Melhorias na interface UI/UX do Dashboard.
-*   Suporte a mais tipos de missões (além de Hauling).
+### Areas for Improvement
+*   Refinement of Regex patterns to capture more mission log variations.
+*   UI/UX improvements for the Dashboard.
+*   Support for more mission types (beyond Hauling).
 
-## 📂 Estrutura de Arquivos
+## 📂 File Structure
 
-*   `hauling_web_tst.py`: Código principal da aplicação (Servidor Flask + Parser de Log).
-*   `hauling_config.json`: Arquivo de configuração.
-*   `hauling_lang_pt.json`: Arquivo de tradução PT-BR.
-*   `hauling_lang_en.json`: Arquivo de tradução EN.
-*   `hauling_state.json`: Arquivo gerado automaticamente para salvar o progresso (não deve ser commitado).
+*   `hauling_web_tst.py`: Main application code (Flask Server + Log Parser).
+*   `hauling_config.json`: Configuration file.
+*   `hauling_lang_pt.json`: PT-BR translation file.
+*   `hauling_lang_en.json`: EN translation file.
+*   `hauling_state.json`: Automatically generated file to save progress (should not be committed).
 
 ---
-Desenvolvido pela comunidade para a comunidade. Fly safe! o7
+Developed by the community for the community. Fly safe! o7
