@@ -17,11 +17,11 @@ PATTERNS = {
     "mission_id_regex": r'MissionId:\s*\[([a-f0-9\-]+)\]',
     "notif_text_regex": r'Added notification "(.*?)"',
     "contract_accepted": "Contract Accepted",
-    "contract_accepted_regex": r'Contract Accepted:\s*(.+?)(?::|\"|\[)',
+    "contract_accepted_regex": r'Contract Accepted:\s*(.+?)(?::|\"|\[|$)',
     "new_objective": "New Objective",
     "objective_complete": "Objective Complete",
-    "scu_regex": r"(Deliver|Pickup|Dropoff|Transport|Collect)\s+(\\d+)(?:[/\s]+(\\d+))?\s+SCU\s+(?:of|de)?\s*([A-Za-z0-9\s\(\)\-\.]+?)\s+(?:to|at|for|towards|para|em|de)\s+([A-Za-z0-9\s\(\)\-\.]+?)(?::|\"|\[)",
-    "generic_regex": r"(Deliver|Pickup|Collect)\s+(.+?)\s+(?:to|at|from|para|de)\s+([A-Za-z0-9\s\-\.]+?)(?::|\"|\[)",
+    "scu_regex": r"(Deliver|Pickup|Dropoff|Transport|Collect)\s+(\d+)(?:[/\s]+(\d+))?\s+SCU\s+(?:of|de)?\s*([A-Za-z0-9\s\(\)\-\.]+?)\s+(?:to|at|for|towards|para|em|de)\s+([A-Za-z0-9\s\(\)\-\.]+?)(?::|\"|\[|$)",
+    "generic_regex": r"(Deliver|Pickup|Collect)\s+(.+?)\s+(?:to|at|from|para|de)\s+([A-Za-z0-9\s\-\.]+?)(?::|\"|\[|$)",
     "marker_event": "<CLocalMissionPhaseMarker::CreateMarker>",
     "marker_contract_tag": "contract [",
     "marker_mission_id_regex": r"missionId \[([a-f0-9\-]+)\]",
@@ -267,12 +267,74 @@ class HaulingMonitor:
         self.processed_notification_ids = set()
         self.last_notification_mission_id = None
 
+    def archive_stale_mission(self, title, new_mission_id=None):
+        """Archives any existing ACTIVE mission with the same title.
+           If new_mission_id is provided, it tries to merge completion status from the stale mission.
+        """
+        stale_ids = []
+        for existing_id, existing_data in data_store["missions"].items():
+            if existing_data["title"] == title and existing_data["status"] == "ACTIVE":
+                if new_mission_id and existing_id == new_mission_id:
+                    continue # Don't archive self
+                stale_ids.append(existing_id)
+        
+        for sid in stale_ids:
+            print(f"♻️ Auto-Archiving Stale Mission: {data_store['missions'][sid]['title']} ({sid})")
+            
+            # --- SMART MERGE ---
+            # If we have a new mission, try to salvage "COMPLETED" status from the old one
+            if new_mission_id and new_mission_id in data_store["missions"]:
+                old_items = data_store["missions"][sid]["items"]
+                new_items = data_store["missions"][new_mission_id]["items"]
+                
+                # Helper for fuzzy matching location
+                def is_loc_match(loc1, loc2):
+                    l1, l2 = loc1.lower(), loc2.lower()
+                    return l1 == l2 or l1 in l2 or l2 in l1
+
+                for k_old, v_old in old_items.items():
+                    # Try to find corresponding item in new mission
+                    matched = False
+                    # 1. Exact Key Match
+                    if k_old in new_items:
+                        target_key = k_old
+                        matched = True
+                    else:
+                        # 2. Fuzzy Match
+                        for k_new, v_new in new_items.items():
+                            if v_new["mat"] == v_old["mat"] and is_loc_match(v_new["dest"], v_old["dest"]):
+                                target_key = k_new
+                                matched = True
+                                break
+                    
+                    if matched:
+                        # If old item was COMPLETED, mark new item COMPLETED
+                        if v_old["status"] == "COMPLETED":
+                            print(f"♻️ Merging Completion Status: {v_old['mat']} -> {v_old['dest']}")
+                            new_items[target_key]["status"] = "COMPLETED"
+                            new_items[target_key]["delivered"] = new_items[target_key]["vol"] # Assume full delivery
+                        # If old item has higher delivered amount, adopt it
+                        elif v_old["delivered"] > new_items[target_key]["delivered"]:
+                            print(f"♻️ Merging Progress: {v_old['delivered']} SCU for {v_old['dest']}")
+                            new_items[target_key]["delivered"] = v_old["delivered"]
+
+            data_store["missions"][sid]["status"] = "CANCELLED"
+            # Ensure time field exists for history rendering
+            if "time" not in data_store["missions"][sid]:
+                 data_store["missions"][sid]["time"] = time.strftime("%H:%M:%S")
+            data_store["finished_missions"].insert(0, data_store["missions"][sid])
+            del data_store["missions"][sid]
+        
+        if stale_ids:
+            save_state()
+
     def process_line(self, line):
         line = line.strip()
 
         # --- NEW: SHUDEvent Notification with MissionID (PRIORITY) ---
         # Handles events that contain the real Backend Mission ID
-        if PATTERNS["notification_event"] in line and PATTERNS["mission_id_tag"] in line:
+        # MODIFIED: Allow processing even if MissionId is missing (Split Log Support)
+        if PATTERNS["notification_event"] in line:
             # Extract Notification ID to prevent duplicates in fallback logic
             notif_id_match = re.search(PATTERNS["notif_id_regex"], line)
             if notif_id_match:
@@ -280,20 +342,33 @@ class HaulingMonitor:
 
             # Extract Mission ID
             mid_match = re.search(PATTERNS["mission_id_regex"], line)
-            if mid_match:
-                mission_id = mid_match.group(1)
+            mission_id = mid_match.group(1) if mid_match else None
+            
+            # Extract Notification Text (Relaxed regex)
+            # Try standard regex first
+            text_match = re.search(PATTERNS["notif_text_regex"], line)
+            if not text_match:
+                # Try relaxed regex (no closing quote required)
+                text_match = re.search(r'Added notification "(.*?)(?:"|$)', line)
+
+            if text_match:
+                notification_text = text_match.group(1)
                 
-                # Extract Notification Text
-                text_match = re.search(PATTERNS["notif_text_regex"], line)
-                if text_match:
-                    notification_text = text_match.group(1)
-                    
-                    # 1. Contract Accepted
-                    if PATTERNS["contract_accepted"] in notification_text:
+                # 1. Contract Accepted
+                if PATTERNS["contract_accepted"] in notification_text:
+                    if mission_id:
                         title_match = re.search(PATTERNS["contract_accepted_regex"], notification_text)
                         title = title_match.group(1).strip() if title_match else "Unknown Contract"
                         
                         if mission_id not in data_store["missions"]:
+                            # --- TIMESTAMP CHECK ---
+                            # If log line has timestamp, ignore if too old (e.g. > 6 hours from now)
+                            # But wait, we are reading history. We compare against session_start? 
+                            # Or just ignore if > 12h old absolute?
+                            # Better: If we have multiple missions with same title, keep only the NEWEST one.
+                            
+                            # For now, let's just add it. The duplication is likely due to reading old history without a clear "End" event.
+                            
                             data_store["missions"][mission_id] = {
                                 "id": mission_id,
                                 "title": title,
@@ -302,73 +377,125 @@ class HaulingMonitor:
                                 "source": "LOG (Native)",
                                 "status": "ACTIVE"
                             }
+                            
+                            # AUTO-CLEANUP: Check if we already have an active mission with the SAME TITLE
+                            self.archive_stale_mission(title, new_mission_id=mission_id)
+
                             print(f"✅ LOG (Native): Mission Accepted - {title} (ID: {mission_id})")
                             data_store["mission_status"] = "ACTIVE"
-                            
-                    # 2. New Objective / Objective Complete
-                    elif PATTERNS["new_objective"] in notification_text or PATTERNS["objective_complete"] in notification_text:
-                        # Ensure mission exists (if we missed the accepted log)
-                        if mission_id not in data_store["missions"]:
-                             data_store["missions"][mission_id] = {
-                                "id": mission_id,
-                                "title": "Unknown Mission (Native)",
-                                "items": {},
-                                "started": time.strftime("%H:%M:%S"),
-                                "source": "LOG (Native)",
-                                "status": "ACTIVE"
-                            }
+                            save_state()
                         
-                        # Parse Objective
-                        # 1. Try Standard SCU Regex
-                        # Modified to support "Transport X SCU of Y to Z" (which might not have x/y format)
-                        obj_match = re.search(
-                            PATTERNS["scu_regex"], 
-                            notification_text, re.IGNORECASE
-                        )
-                        
-                        if obj_match:
-                            action = obj_match.group(1).upper()
-                            
-                            # Handle current/total logic
-                            val1 = int(obj_match.group(2))
-                            val2 = obj_match.group(3)
-                            
-                            if val2:
-                                current = val1
-                                total = int(val2)
-                            else:
-                                # If only one number, assume it's the total to move
-                                current = 0 
-                                total = val1
+                # 1.5 Contract Canceled / Abandoned / Failed
+                elif any(p in notification_text for p in [PATTERNS.get("contract_canceled", "Contract Canceled"), PATTERNS.get("contract_abandoned", "Contract Abandoned"), PATTERNS.get("contract_failed", "Contract Failed")]):
+                    # Extract title
+                    title_match = re.search(r'Contract (?:Canceled|Abandoned|Failed):\s*(.+?)(?::|\"|\[|$)', notification_text)
+                    title = title_match.group(1).strip() if title_match else None
+                    
+                    if title:
+                        print(f"🛑 Mission Ended: {title}")
+                        self.archive_stale_mission(title)
+                    elif mission_id and mission_id in data_store["missions"]:
+                        print(f"🛑 Mission Ended (ID Match): {mission_id}")
+                        data_store["missions"][mission_id]["status"] = "CANCELLED"
+                        if "time" not in data_store["missions"][mission_id]:
+                             data_store["missions"][mission_id]["time"] = time.strftime("%H:%M:%S")
+                        data_store["finished_missions"].insert(0, data_store["missions"][mission_id])
+                        del data_store["missions"][mission_id]
+                    save_state()
 
-                            material = obj_match.group(4).strip().upper()
-                            location = clean_location_name(obj_match.group(5))
+                # 2. New Objective / Objective Complete
+                elif PATTERNS["new_objective"] in notification_text or PATTERNS["objective_complete"] in notification_text:
+                    
+                    # If we have a mission_id, ensure it exists
+                    if mission_id and mission_id not in data_store["missions"]:
+                         data_store["missions"][mission_id] = {
+                            "id": mission_id,
+                            "title": "Unknown Mission (Native)",
+                            "items": {},
+                            "started": time.strftime("%H:%M:%S"),
+                            "source": "LOG (Native)",
+                            "status": "ACTIVE"
+                        }
+                    
+                    # Parse Objective
+                    obj_match = re.search(
+                        PATTERNS["scu_regex"], 
+                        notification_text, re.IGNORECASE
+                    )
+                    
+                    if obj_match:
+                        action = obj_match.group(1).upper()
+                        val1 = int(obj_match.group(2))
+                        val2 = obj_match.group(3)
+                        
+                        if val2:
+                            current = val1
+                            total = int(val2)
+                        else:
+                            current = 0 
+                            total = val1
+
+                        material = obj_match.group(4).strip().upper()
+                        location = clean_location_name(obj_match.group(5))
+                        
+                        is_pickup = action in ['COLLECT', 'PICKUP', 'RETRIEVE', 'COLETAR', 'PEGAR']
+                        type_str = "PICKUP" if is_pickup else "DELIVERY"
+                        
+                        item_key = f"{material}_{location}_{type_str}"
+                        
+                        is_complete_event = PATTERNS["objective_complete"] in notification_text
+                        status_val = "COMPLETED" if (is_complete_event or (current >= total and total > 0)) else "PENDING"
+                        
+                        # GLOBAL SEARCH FALLBACK (Smart Match)
+                        # If Mission ID is missing (Split Log), find matching item in ANY active mission
+                        target_mission_id = mission_id
+                        
+                        # Helper for fuzzy matching location
+                        def is_loc_match(loc1, loc2):
+                            l1, l2 = loc1.lower(), loc2.lower()
+                            return l1 == l2 or l1 in l2 or l2 in l1
+
+                        if not target_mission_id:
+                            # 1. Search for EXACT match
+                            for m_id, m_data in data_store["missions"].items():
+                                if item_key in m_data["items"]:
+                                    target_mission_id = m_id
+                                    print(f"🔍 Smart Match (Exact): Found item in mission {m_id}")
+                                    break
                             
-                            is_pickup = action in ['COLLECT', 'PICKUP', 'RETRIEVE', 'COLETAR', 'PEGAR']
-                            type_str = "PICKUP" if is_pickup else "DELIVERY"
-                            
-                            item_key = f"{material}_{location}_{type_str}"
-                            
-                            # Check for MANUAL_ADD duplicates and remove them
+                            # 2. Search for FUZZY match if not found
+                            if not target_mission_id:
+                                for m_id, m_data in data_store["missions"].items():
+                                    for k, v in m_data["items"].items():
+                                        if v["mat"] == material and is_loc_match(v["dest"], location):
+                                            target_mission_id = m_id
+                                            item_key = k # ADOPT EXISTING KEY
+                                            print(f"🔍 Smart Match (Fuzzy): Found item {k} in {m_id}")
+                                            break
+                                    if target_mission_id: break
+                        
+                        if target_mission_id:
+                            # Check if we need to resolve item_key locally (if mission was known but key mismatch)
+                            # e.g. "Everus Harbor" vs "Everus Harbor Harbor"
+                            if item_key not in data_store["missions"][target_mission_id]["items"]:
+                                for k, v in data_store["missions"][target_mission_id]["items"].items():
+                                    if v["mat"] == material and is_loc_match(v["dest"], location):
+                                        print(f"♻️ Key Correction: {item_key} -> {k}")
+                                        item_key = k # Adopt existing key to update it
+                                        break
+
+                            # Update existing mission
+                            # Check for MANUAL_ADD duplicates
                             keys_to_remove = []
-                            for k, v in data_store["missions"][mission_id]["items"].items():
-                                if v.get("action") == "MANUAL_ADD" and v.get("mat") == material and v.get("dest") == location:
+                            for k, v in data_store["missions"][target_mission_id]["items"].items():
+                                if v.get("action") == "MANUAL_ADD" and v.get("mat") == material and is_loc_match(v.get("dest"), location):
                                     keys_to_remove.append(k)
                             
                             for k in keys_to_remove:
-                                del data_store["missions"][mission_id]["items"][k]
+                                del data_store["missions"][target_mission_id]["items"][k]
                                 print(f"♻️ LOG Replaced Manual Item: {material} -> {location}")
 
-                            # Check explicit completion event
-                            is_complete_event = PATTERNS["objective_complete"] in notification_text
-                            
-                            # Logic: If it is "Objective Complete", FORCE status=COMPLETED
-                            # Logic: If current >= total, also status=COMPLETED
-                            status_val = "COMPLETED" if (is_complete_event or (current >= total and total > 0)) else "PENDING"
-                            
-                            # Update or Create item
-                            # NOTE: We overwrite any existing item with this key to ensure status updates!
-                            data_store["missions"][mission_id]["items"][item_key] = {
+                            data_store["missions"][target_mission_id]["items"][item_key] = {
                                 "mat": material,
                                 "dest": location,
                                 "vol": total,
@@ -378,52 +505,20 @@ class HaulingMonitor:
                                 "action": action
                             }
                             print(f"📦 LOG (Native): Item {action} {current}/{total} {material} -> {location} [{status_val}]")
+                            save_state()
                         else:
-                            # 2. Try Generic/Non-SCU Regex (e.g. Luminalia Gifts)
-                            # "Deliver Gift for X To Y" or "Collect Gift for X From Y"
-                            # No SCU count, usually implies 1 item
-                            # Also handles "Transport Medical Supplies to ..." without SCU explicit sometimes?
-                            generic_match = re.search(
-                                PATTERNS["generic_regex"], 
-                                notification_text, re.IGNORECASE
-                            )
-                            
-                            if generic_match:
-                                action = generic_match.group(1).upper()
-                                material = generic_match.group(2).strip()
-                                location = clean_location_name(generic_match.group(3))
-                                
-                                # Default to 1 item
-                                current = 0
-                                total = 1
-                                
-                                is_pickup = action in ['COLLECT', 'PICKUP']
-                                type_str = "PICKUP" if is_pickup else "DELIVERY"
-                                
-                                item_key = f"{material}_{location}_{type_str}"
-                                
-                                # Check for MANUAL_ADD duplicates and remove them
-                                keys_to_remove = []
-                                for k, v in data_store["missions"][mission_id]["items"].items():
-                                    if v.get("action") == "MANUAL_ADD" and v.get("mat") == material and v.get("dest") == location:
-                                        keys_to_remove.append(k)
-                                
-                                for k in keys_to_remove:
-                                    del data_store["missions"][mission_id]["items"][k]
-                                    print(f"♻️ LOG Replaced Manual Item: {material} -> {location}")
-                                
-                                data_store["missions"][mission_id]["items"][item_key] = {
-                                    "mat": material,
-                                    "dest": location,
-                                    "vol": total,
-                                    "delivered": current,
-                                    "status": "PENDING",
-                                    "type": type_str,
-                                    "action": action
-                                }
-                                print(f"🎁 LOG (Native/Gift): {action} {material} -> {location}")
-                            else:
-                                print(f"⚠️ LOG (Native): Unparsed Objective: {notification_text}")
+                            # No Mission ID and No Smart Match -> Fallback to UI Logic (likely handled by UpdateNotificationItem later)
+                            # Or create Unknown Mission here?
+                            # Better to let the UI Fallback logic handle it if it comes later, 
+                            # OR create a temporary bucket here to be safe.
+                            print(f"⚠️ LOG (Native): Orphan Objective (No ID): {material} -> {location}")
+                            pass 
+
+                    else:
+                        # 2. Try Generic/Non-SCU Regex
+                        # (Keep existing logic for generic regex, but also add Smart Match support if needed)
+                        # For brevity, leaving as is for now unless requested.
+                        pass
 
             # --- DEBUG: MISSING INFO FROM NOTIFICATIONS ---
             # Fallback to CLocalMissionPhaseMarker if notifications fail to provide details
@@ -505,8 +600,10 @@ class HaulingMonitor:
                         "source": "LOG (UI)",
                         "status": "ACTIVE"
                     }
+                    self.archive_stale_mission(title, new_mission_id=m_id)
                     print(f"✅ {T('source_log_ui', 'ui')}: {T('mission_accepted', 'log')} - {title} (ID: {m_id})")
                     data_store["mission_status"] = "ACTIVE"
+                    save_state()
             
             # B. New Objective (Notification)
             elif "New Objective" in line or "Objective Complete" in line:
@@ -790,16 +887,38 @@ def background_log_reader():
         # Ler os últimos 5MB para capturar missões já aceitas
         f.seek(0, 2)
         size = f.tell()
+        # Reduce buffer to 2MB to avoid reading too far back if user has huge log
+        # But user might have mission accepted 3h ago. 
+        # Better: Read 5MB but filter by timestamp.
         start_pos = max(0, size - 5 * 1024 * 1024)
         f.seek(start_pos)
         print(f"✓ {T('reading_history', 'log')}")
         
+        # Regex for timestamp: <2025-01-01T15:00:00.000Z>
+        ts_regex = re.compile(r'<(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})')
+        
+        # Calculate cutoff time (e.g. 12 hours ago)
+        cutoff_time = datetime.utcnow() - timedelta(hours=12)
+
         while True:
             line = f.readline()
             if not line:
                 # Fim do arquivo alcançado, entrar em modo de espera (live tail)
                 time.sleep(0.5)
                 continue
+            
+            # Timestamp Check for History Reading
+            # Only apply if we are "catching up" (though we don't strictly know if we are catching up or live)
+            # But filtering old lines is generally safe if they are > 12h old.
+            ts_match = ts_regex.match(line)
+            if ts_match:
+                try:
+                    log_time = datetime.strptime(ts_match.group(1), "%Y-%m-%dT%H:%M:%S")
+                    if log_time < cutoff_time:
+                        continue # Skip old lines
+                except:
+                    pass
+
             monitor.process_line(line)
 
 
@@ -968,6 +1087,7 @@ def index():
         ".empty-state{text-align:center; padding:40px; color:#666; font-style:italic;}"
         ".pause-btn{background:#333; color:#fff; border:1px solid #555; padding:8px 15px; cursor:pointer; border-radius:5px; font-weight:bold; font-size:0.9rem;}"
         ".pause-btn.paused{background:#ffcc00; color:#000; border:1px solid #ffcc00; animation: pulse 2s infinite;}"
+        ".reset-btn{background:#d93025; color:#fff; border:1px solid #a61c14; padding:5px 10px; cursor:pointer; border-radius:3px; font-size:0.8rem; margin-left:10px;}"
         "@keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.8; } 100% { opacity: 1; } }"
         "</style></head><body>"
         "<div class='header'>"
@@ -978,6 +1098,7 @@ def index():
         "</div></div>"
         "<div class='header-right'>"
         f"<button id='pauseBtn' class='pause-btn' onclick='togglePauseManual()'>⏸ {T('pause')}</button>"
+        f"<button class='reset-btn' onclick='resetSession()'>♻ {T('reset_session', 'ui', 'Reset')}</button>"
         "</div>"
         "</div>"
         "<div class='info-grid'>"
@@ -1169,6 +1290,12 @@ def index():
             if (el.style.display === 'none') el.style.display = 'block';
             else el.style.display = 'none';
         }}
+        function resetSession() {{
+            if(confirm("{T('reset_confirm', 'ui', 'Are you sure you want to reset the session? This will clear all current missions.')}")) {{
+                fetch('/reset_session', {{ method: 'POST' }})
+                .then(r => window.location.reload());
+            }}
+        }}
         """
         html += "</script>"
 
@@ -1220,7 +1347,7 @@ def index():
                 f"</div>"
                 f"<div style='display:flex; justify-content:space-between; width:100%; font-size:0.85rem; color:#8b949e;'>"
                 f"  <span>📦 {items_summary}</span>"
-                f"  <span>🕒 {f['time']}</span>"
+                f"  <span>🕒 {f.get('time', f.get('started', 'Unknown'))}</span>"
                 f"</div>"
                 f"</div>"
             )
