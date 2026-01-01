@@ -1,6 +1,4 @@
 {
-  "api_key": "YOUR_API_KEY_HERE",
-  "model_name": "gemini-2.0-flash",
   "log_path": "C:/Program Files/Roberts Space Industries/StarCitizen/LIVE/Game.log",
   "web_port": 5000,
   "web_host": "0.0.0.0",
