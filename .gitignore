@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+*.txt
+*.rar
+*.zip
+*.exe
+*.spec
+*.bak
+* - Copia*.py
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDEs
+.vscode/
+.idea/
+
+# Distribution
+build/
+dist/
+HaulingMonitor_Dist/
+Hauling_Desktop_Dist/
+
+# Local/Temp files
+LIXO/
+hauling_state.json
+clean_game_log.log
+game_events.db*
+reparse.db
