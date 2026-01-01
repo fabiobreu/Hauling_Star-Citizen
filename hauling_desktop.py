@@ -85,6 +85,17 @@ def clean_location_name(raw_name):
     name = re.sub(r'Stanton_\d+_', '', name, flags=re.IGNORECASE)
     name = name.replace('_', ' ').replace("DistributionCentre", "Dist.Center")
     name = name.title()
+    
+    # Specific Station Mappings (Internal Codes)
+    station_map = {
+        r'\bRr\s*Hur\s*Leo\b': 'Everus Harbor',
+        r'\bRr\s*Mic\s*Leo\b': 'Port Tressler',
+        r'\bRr\s*Arc\s*Leo\b': 'Baijini Point',
+        r'\bRr\s*Cru\s*Leo\b': 'Seraphim Station'
+    }
+    for pattern, real_name in station_map.items():
+        name = re.sub(pattern, real_name, name, flags=re.IGNORECASE)
+
     name = re.sub(r'\bOm\b', 'OM', name)
     name = re.sub(r'\bL(\d+)\b', r'L\1', name)
     return name.strip()

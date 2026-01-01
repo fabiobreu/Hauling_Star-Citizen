@@ -160,6 +160,12 @@ def clean_location_name(raw_name):
     
     # 4. Expand Abbreviations & Fix Common Terms
     replacements = [
+        # Specific Station Mappings (Internal Codes -> Real Names)
+        (r'\bRr\s*Hur\s*Leo\b', 'Everus Harbor'),
+        (r'\bRr\s*Mic\s*Leo\b', 'Port Tressler'),
+        (r'\bRr\s*Arc\s*Leo\b', 'Baijini Point'),
+        (r'\bRr\s*Cru\s*Leo\b', 'Seraphim Station'),
+        
         (r'\bDistCenter\b', 'Distribution Center'),
         (r'\bInt\b', 'Interchange'),
         (r'\bStn\b', 'Station'),
@@ -186,8 +192,8 @@ def clean_location_name(raw_name):
         
         # Stations
         (r'\bHur\b', 'HUR'), (r'\bCru\b', 'CRU'), (r'\bArc\b', 'ARC'), (r'\bMic\b', 'MIC'),
-        (r'\bHdpc\b', 'HDPC'), (r'\bBaijini\b', 'Baijini Point'), (r'\bTressler\b', 'Port Tressler'),
-        (r'\bEverus\b', 'Everus Harbor'), (r'\bRiker\b', 'Riker Memorial'),
+        (r'\bHdpc\b', 'HDPC'), (r'\bBaijini\b(?!\s*Point)', 'Baijini Point'), (r'(?<!Port\s)\bTressler\b', 'Port Tressler'),
+        (r'\bEverus\b(?!\s*Harbor)', 'Everus Harbor'), (r'\bRiker\b(?!\s*Memorial)', 'Riker Memorial'),
         
         # Cargo/Units
         (r'\bScu\b', 'SCU'),
