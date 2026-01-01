@@ -14,6 +14,9 @@ Hauling mission monitoring tool for Star Citizen. This application reads the gam
 -   **Persistence**: Current state is automatically saved (`hauling_state.json`), allowing you to close and reopen the tool without losing progress.
 -   **Identification**: Automatically detects the player name and ship used.
 
+-   <img width="909" height="917" alt="image" src="https://github.com/user-attachments/assets/204040bd-1356-4f28-851c-96a3ec472c49" />
+
+
 ## 🛠️ Installation and Execution
 
 ### Prerequisites
