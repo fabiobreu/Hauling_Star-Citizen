@@ -267,66 +267,98 @@ class HaulingMonitor:
         self.processed_notification_ids = set()
         self.last_notification_mission_id = None
 
-    def archive_stale_mission(self, title, new_mission_id=None):
-        """Archives any existing ACTIVE mission with the same title.
+    def archive_specific_mission(self, stale_id, new_mission_id=None):
+        """Archives a specific active mission by ID.
            If new_mission_id is provided, it tries to merge completion status from the stale mission.
         """
+        if stale_id not in data_store["missions"]:
+            return
+
+        print(f"♻️ Auto-Archiving Stale Mission: {data_store['missions'][stale_id]['title']} ({stale_id})")
+        
+        # --- SMART MERGE ---
+        if new_mission_id and new_mission_id in data_store["missions"]:
+            old_items = data_store["missions"][stale_id]["items"]
+            new_items = data_store["missions"][new_mission_id]["items"]
+            
+            # Helper for fuzzy matching location
+            def is_loc_match(loc1, loc2):
+                l1, l2 = loc1.lower(), loc2.lower()
+                return l1 == l2 or l1 in l2 or l2 in l1
+
+            for k_old, v_old in old_items.items():
+                matched = False
+                # 1. Exact Key Match
+                if k_old in new_items:
+                    target_key = k_old
+                    matched = True
+                else:
+                    # 2. Fuzzy Match
+                    for k_new, v_new in new_items.items():
+                        if v_new["mat"] == v_old["mat"] and is_loc_match(v_new["dest"], v_old["dest"]):
+                            target_key = k_new
+                            matched = True
+                            break
+                
+                if matched:
+                    if v_old["status"] == "COMPLETED":
+                        print(f"♻️ Merging Completion Status: {v_old['mat']} -> {v_old['dest']}")
+                        new_items[target_key]["status"] = "COMPLETED"
+                        new_items[target_key]["delivered"] = new_items[target_key]["vol"]
+                    elif v_old["delivered"] > new_items[target_key]["delivered"]:
+                        print(f"♻️ Merging Progress: {v_old['delivered']} SCU for {v_old['dest']}")
+                        new_items[target_key]["delivered"] = v_old["delivered"]
+
+        data_store["missions"][stale_id]["status"] = "CANCELLED"
+        if "time" not in data_store["missions"][stale_id]:
+             data_store["missions"][stale_id]["time"] = time.strftime("%H:%M:%S")
+        data_store["finished_missions"].insert(0, data_store["missions"][stale_id])
+        del data_store["missions"][stale_id]
+        save_state()
+
+    def archive_stale_mission(self, title, new_mission_id=None):
+        """Wrapper for backward compatibility: Archives ALL active missions with same title."""
         stale_ids = []
         for existing_id, existing_data in data_store["missions"].items():
             if existing_data["title"] == title and existing_data["status"] == "ACTIVE":
                 if new_mission_id and existing_id == new_mission_id:
-                    continue # Don't archive self
+                    continue
                 stale_ids.append(existing_id)
         
         for sid in stale_ids:
-            print(f"♻️ Auto-Archiving Stale Mission: {data_store['missions'][sid]['title']} ({sid})")
-            
-            # --- SMART MERGE ---
-            # If we have a new mission, try to salvage "COMPLETED" status from the old one
-            if new_mission_id and new_mission_id in data_store["missions"]:
-                old_items = data_store["missions"][sid]["items"]
-                new_items = data_store["missions"][new_mission_id]["items"]
-                
-                # Helper for fuzzy matching location
-                def is_loc_match(loc1, loc2):
-                    l1, l2 = loc1.lower(), loc2.lower()
-                    return l1 == l2 or l1 in l2 or l2 in l1
+            self.archive_specific_mission(sid, new_mission_id)
 
-                for k_old, v_old in old_items.items():
-                    # Try to find corresponding item in new mission
-                    matched = False
-                    # 1. Exact Key Match
-                    if k_old in new_items:
-                        target_key = k_old
-                        matched = True
-                    else:
-                        # 2. Fuzzy Match
-                        for k_new, v_new in new_items.items():
-                            if v_new["mat"] == v_old["mat"] and is_loc_match(v_new["dest"], v_old["dest"]):
-                                target_key = k_new
-                                matched = True
-                                break
-                    
-                    if matched:
-                        # If old item was COMPLETED, mark new item COMPLETED
-                        if v_old["status"] == "COMPLETED":
-                            print(f"♻️ Merging Completion Status: {v_old['mat']} -> {v_old['dest']}")
-                            new_items[target_key]["status"] = "COMPLETED"
-                            new_items[target_key]["delivered"] = new_items[target_key]["vol"] # Assume full delivery
-                        # If old item has higher delivered amount, adopt it
-                        elif v_old["delivered"] > new_items[target_key]["delivered"]:
-                            print(f"♻️ Merging Progress: {v_old['delivered']} SCU for {v_old['dest']}")
-                            new_items[target_key]["delivered"] = v_old["delivered"]
+    def detect_and_merge_duplicate(self, current_mission_id, item_data):
+        """
+        Checks if there is ANOTHER active mission with the same Title AND same Item (Mat+Dest+Vol).
+        """
+        if current_mission_id not in data_store["missions"]: return
 
-            data_store["missions"][sid]["status"] = "CANCELLED"
-            # Ensure time field exists for history rendering
-            if "time" not in data_store["missions"][sid]:
-                 data_store["missions"][sid]["time"] = time.strftime("%H:%M:%S")
-            data_store["finished_missions"].insert(0, data_store["missions"][sid])
-            del data_store["missions"][sid]
+        current_mission = data_store["missions"][current_mission_id]
+        title = current_mission["title"]
         
-        if stale_ids:
-            save_state()
+        def is_loc_match(loc1, loc2):
+            l1, l2 = loc1.lower(), loc2.lower()
+            return l1 == l2 or l1 in l2 or l2 in l1
+
+        duplicate_found_id = None
+        for other_id, other_data in data_store["missions"].items():
+            if other_id == current_mission_id: continue
+            if other_data["status"] != "ACTIVE": continue
+
+            if other_data["title"] == title:
+                # Check items in other mission
+                for k, v in other_data["items"].items():
+                    if v["mat"] == item_data["mat"] and \
+                       is_loc_match(v["dest"], item_data["dest"]) and \
+                       v["vol"] == item_data["vol"]:
+                        duplicate_found_id = other_id
+                        break
+            if duplicate_found_id: break
+        
+        if duplicate_found_id:
+            print(f"♻️ Duplicate Mission Detected via Item Match! ({title})")
+            self.archive_specific_mission(duplicate_found_id, new_mission_id=current_mission_id)
 
     def process_line(self, line):
         line = line.strip()
@@ -379,7 +411,8 @@ class HaulingMonitor:
                             }
                             
                             # AUTO-CLEANUP: Check if we already have an active mission with the SAME TITLE
-                            self.archive_stale_mission(title, new_mission_id=mission_id)
+                            # MOVED TO ITEM DETECTION (Smart Merge v2) to avoid false positives with different missions sharing same title.
+                            # self.archive_stale_mission(title, new_mission_id=mission_id)
 
                             print(f"✅ LOG (Native): Mission Accepted - {title} (ID: {mission_id})")
                             data_store["mission_status"] = "ACTIVE"
@@ -506,6 +539,10 @@ class HaulingMonitor:
                             }
                             print(f"📦 LOG (Native): Item {action} {current}/{total} {material} -> {location} [{status_val}]")
                             save_state()
+                            
+                            # Check for duplicates via item match
+                            self.detect_and_merge_duplicate(target_mission_id, data_store["missions"][target_mission_id]["items"][item_key])
+
                         else:
                             # No Mission ID and No Smart Match -> Fallback to UI Logic (likely handled by UpdateNotificationItem later)
                             # Or create Unknown Mission here?
@@ -600,7 +637,7 @@ class HaulingMonitor:
                         "source": "LOG (UI)",
                         "status": "ACTIVE"
                     }
-                    self.archive_stale_mission(title, new_mission_id=m_id)
+                    # self.archive_stale_mission(title, new_mission_id=m_id)
                     print(f"✅ {T('source_log_ui', 'ui')}: {T('mission_accepted', 'log')} - {title} (ID: {m_id})")
                     data_store["mission_status"] = "ACTIVE"
                     save_state()
@@ -668,6 +705,10 @@ class HaulingMonitor:
                     }
                     print(f"📦 {T('source_log_ui', 'ui')}: {T('item_log', 'log')} {action} {current}/{total} {material} -> {location} [{status_val}]")
                     save_state()
+
+                    # Check for duplicates via item match
+                    if m_id in data_store["missions"] and item_key in data_store["missions"][m_id]["items"]:
+                        self.detect_and_merge_duplicate(m_id, data_store["missions"][m_id]["items"][item_key])
 
         # 1. IDENTITY DETECTION
         chat_match = re.search(r"joined channel '(.+?) : (.+?)'", line)
