@@ -1,0 +1,22 @@
+COMO USAR O HAULING MONITOR
+===========================
+
+1. Execução
+   - Basta abrir o arquivo "HaulingMonitor.exe".
+   - Uma janela preta (terminal) vai abrir mostrando o status.
+   - O navegador deve abrir automaticamente com o painel (http://localhost:5000).
+
+2. Configuração (Opcional)
+   - O arquivo "hauling_config.json" contém as configurações.
+   - Se precisar mudar o caminho do log do jogo, edite a linha "log_path".
+   - Para mudar o idioma, altere "language": "en" para "language": "pt".
+
+3. Idioma
+   - O programa suporta Inglês (en) e Português (pt).
+   - Você pode editar os arquivos hauling_lang_*.json se quiser ajustar as traduções.
+
+4. Dúvidas
+   - Se o navegador não abrir, digite http://localhost:5000 na barra de endereços.
+   - Mantenha a janela preta aberta enquanto estiver jogando.
+
+Bom jogo!

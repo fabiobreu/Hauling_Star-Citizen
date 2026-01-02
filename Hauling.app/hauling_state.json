@@ -1,0 +1,88 @@
+{
+  "missions": {
+    "f418f30c-41ec-4aa7-b47e-803d6e13864d": {
+      "id": "f418f30c-41ec-4aa7-b47e-803d6e13864d",
+      "title": "Member Rank - Small Cargo Haul",
+      "items": {
+        "TUNGSTEN_HDPC-Farnesway_DELIVERY": {
+          "mat": "TUNGSTEN",
+          "dest": "HDPC-Farnesway",
+          "vol": 5,
+          "delivered": 0,
+          "status": "PENDING",
+          "type": "DELIVERY",
+          "action": "DELIVER"
+        },
+        "TUNGSTEN_Sakura Sun Magnolia Workcenter_DELIVERY": {
+          "mat": "TUNGSTEN",
+          "dest": "Sakura Sun Magnolia Workcenter",
+          "vol": 6,
+          "delivered": 0,
+          "status": "PENDING",
+          "type": "DELIVERY",
+          "action": "DELIVER"
+        },
+        "TUNGSTEN_HDPC-Cassillo_DELIVERY": {
+          "mat": "TUNGSTEN",
+          "dest": "HDPC-Cassillo",
+          "vol": 5,
+          "delivered": 0,
+          "status": "PENDING",
+          "type": "DELIVERY",
+          "action": "DELIVER"
+        },
+        "TUNGSTEN_Teasa Spaceport_DELIVERY": {
+          "mat": "TUNGSTEN",
+          "dest": "Teasa Spaceport",
+          "vol": 5,
+          "delivered": 0,
+          "status": "PENDING",
+          "type": "DELIVERY",
+          "action": "DELIVER"
+        }
+      },
+      "started": "15:14:57",
+      "source": "LOG (Native)",
+      "status": "ACTIVE"
+    }
+  },
+  "finished_missions": [
+    {
+      "id": "a7aeafed-0367-4860-b5a6-4e6c893a4449",
+      "title": "Rookie Rank - Direct Extra Small Cargo Haul",
+      "items": {},
+      "value": 50250,
+      "started": "12:01:29",
+      "time": "12:01:29",
+      "source": "LOG",
+      "status": "COMPLETED"
+    },
+    {
+      "id": "a7aeafed-0367-4860-b5a6-4e6c893a4449",
+      "title": "Rookie Rank - Direct Extra Small Cargo Haul",
+      "items": {
+        "QUARTZ_HDPC-Cassillo_DELIVERY_1767274096_0": {
+          "mat": "QUARTZ",
+          "dest": "HDPC-Cassillo",
+          "vol": 6,
+          "delivered": 0,
+          "status": "PENDING",
+          "type": "DELIVERY",
+          "action": "MANUAL_ADD"
+        }
+      },
+      "value": 50250,
+      "started": "10:26:35",
+      "time": "10:39:03",
+      "source": "LOG",
+      "status": "COMPLETED"
+    }
+  ],
+  "player_name": "Lolindirarfar",
+  "ship_name": "DRAKE CORSAIR",
+  "current_location": "Invalid Location Id",
+  "next_destination": "None",
+  "fuel_estimate": 0,
+  "mission_status": "ACTIVE",
+  "session_start": "2026-01-01T10:14:33.416182"
+}
