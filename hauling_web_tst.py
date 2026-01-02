@@ -1252,30 +1252,92 @@ def delete_hangar_item(index):
         save_state()
     return '<meta http-equiv="refresh" content="0;url=/hangar">'
 
+@app.route('/update_hangar_item', methods=['POST'])
+def update_hangar_item():
+    load_state()
+    idx = request.form.get('index')
+    action = request.form.get('action') # 'update' or 'sell'
+    qty = request.form.get('quantity')
+    value = request.form.get('value') # For sale
+    
+    if idx and qty and "hangar" in data_store:
+        try:
+            i = int(idx)
+            q = int(qty)
+            if 0 <= i < len(data_store["hangar"]):
+                item = data_store["hangar"][i]
+                
+                if action == 'sell':
+                    # Reduce quantity and record sale
+                    if q > 0:
+                        item['qty'] -= q
+                        # Record history
+                        if "finished_missions" not in data_store: data_store["finished_missions"] = []
+                        data_store["finished_missions"].insert(0, {
+                            "id": f"SALE_{int(time.time())}",
+                            "title": f"💰 Sold: {item['mat']} ({q} SCU)",
+                            "value": int(value) if value else 0,
+                            "status": "COMPLETED",
+                            "time": time.strftime("%H:%M:%S"),
+                            "items": {
+                                "1": {
+                                    "mat": item["mat"],
+                                    "dest": item["loc"], # Local sale
+                                    "vol": q
+                                }
+                            }
+                        })
+                        print(f"💰 Sold {q} SCU of {item['mat']} at {item['loc']}")
+                        
+                else: # 'update'
+                    # Just set the new quantity
+                    item['qty'] = q
+                
+                # Clean up if empty
+                if item['qty'] <= 0:
+                    data_store["hangar"].pop(i)
+                    
+                save_state()
+        except ValueError:
+            pass
+    return '<meta http-equiv="refresh" content="0;url=/hangar">'
+
 @app.route('/create_manifest', methods=['POST'])
 def create_manifest():
     load_state()
     idx = request.form.get('index')
     dest = request.form.get('destination')
+    qty_str = request.form.get('quantity')
     
-    if idx and dest and "hangar" in data_store:
+    if idx and dest and qty_str and "hangar" in data_store:
         try:
             i = int(idx)
+            req_qty = int(qty_str)
+            
             if 0 <= i < len(data_store["hangar"]):
-                item = data_store["hangar"].pop(i)
+                item = data_store["hangar"][i]
                 
-                if "private_manifests" not in data_store:
-                    data_store["private_manifests"] = []
-                
-                data_store["private_manifests"].append({
-                    "origin": item["loc"],
-                    "destination": dest,
-                    "mat": item["mat"],
-                    "qty": item["qty"],
-                    "started": time.strftime("%H:%M:%S")
-                })
-                print(f"🚚 Route Created: {item['mat']} from {item['loc']} to {dest}")
-                save_state()
+                if req_qty > 0 and req_qty <= item['qty']:
+                    # Deduct from Hangar
+                    item['qty'] -= req_qty
+                    
+                    # If empty, remove from Hangar
+                    if item['qty'] <= 0:
+                        data_store["hangar"].pop(i)
+                    
+                    # Create Route
+                    if "private_manifests" not in data_store:
+                        data_store["private_manifests"] = []
+                    
+                    data_store["private_manifests"].append({
+                        "origin": item["loc"],
+                        "destination": dest,
+                        "mat": item["mat"],
+                        "qty": req_qty,
+                        "started": time.strftime("%H:%M:%S")
+                    })
+                    print(f"🚚 Route Created: {req_qty} SCU {item['mat']} from {item['loc']} to {dest}")
+                    save_state()
         except ValueError:
             pass
     return '<meta http-equiv="refresh" content="0;url=/hangar">'
@@ -1373,6 +1435,7 @@ def hangar_page():
             hangar_html += f"<td style='padding:5px;'>{item['mat']}</td>"
             hangar_html += f"<td style='padding:5px;'>{item['qty']} SCU</td>"
             hangar_html += f"<td style='padding:5px; text-align:right; display:flex; gap:5px; justify-content:flex-end;'>"
+            hangar_html += f"<button onclick=\"editHangarItem('{i}', '{item['loc']}', '{item['mat']}', '{item['qty']}')\" style='background:#ffcc00; color:#000; border:none; padding:2px 5px; cursor:pointer; font-size:0.8rem; border-radius:3px;' title='{T('edit_manage', 'ui', 'Edit / Sell')}'>✏️</button>"
             hangar_html += f"<button onclick=\"openTransport('{i}', '{item['loc']}', '{item['mat']}', '{item['qty']}')\" style='background:#00f2ff; color:#000; border:none; padding:2px 5px; cursor:pointer; font-size:0.8rem; border-radius:3px;'>🚚 {T('transport', 'ui', 'Route')}</button>"
             hangar_html += f"<a href='/delete_hangar_item/{i}' style='color:#ff5555; text-decoration:none; padding:2px 5px; border:1px solid #ff5555; border-radius:3px; font-size:0.8rem;'>🗑️</a>"
             hangar_html += f"</td>"
@@ -1424,9 +1487,48 @@ def hangar_page():
         function openTransport(index, loc, mat, qty) {{
             document.getElementById('trans_origin').value = loc;
             document.getElementById('trans_mat').value = mat;
-            document.getElementById('trans_qty').value = qty;
+            
+            const qtyInput = document.getElementById('trans_qty');
+            qtyInput.value = qty;
+            qtyInput.max = qty;
+            
             document.getElementById('trans_index').value = index;
             document.getElementById('transport_modal').style.display = 'block';
+        }}
+
+        function editHangarItem(index, loc, mat, qty) {{
+            document.getElementById('edit_index').value = index;
+            document.getElementById('edit_loc').textContent = loc;
+            document.getElementById('edit_mat').textContent = mat;
+            
+            // Default to update mode
+            document.getElementById('edit_qty_update').value = qty;
+            document.getElementById('edit_qty_sell').value = 0;
+            
+            // Reset to Update mode
+            const updateRadio = document.querySelector('input[name="action"][value="update"]');
+            if(updateRadio) updateRadio.checked = true;
+            toggleSaleFields(false);
+            
+            document.getElementById('update_hangar_modal').style.display = 'block';
+        }}
+
+        function toggleSaleFields(isSell) {{
+            if (isSell) {{
+                document.getElementById('field_update').style.display = 'none';
+                document.getElementById('edit_qty_update').disabled = true;
+                
+                document.getElementById('field_sell').style.display = 'block';
+                document.getElementById('edit_qty_sell').disabled = false;
+                document.getElementById('edit_qty_sell').focus();
+            }} else {{
+                document.getElementById('field_update').style.display = 'block';
+                document.getElementById('edit_qty_update').disabled = false;
+                
+                document.getElementById('field_sell').style.display = 'none';
+                document.getElementById('edit_qty_sell').disabled = true;
+                document.getElementById('edit_qty_update').focus();
+            }}
         }}
 
         async function updateContent() {{
@@ -1487,6 +1589,44 @@ def hangar_page():
 
         <div id="transports-list">{transports_html}</div>
 
+        <!-- EDIT/SELL MODAL -->
+        <div id="update_hangar_modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); z-index:1000;">
+            <div style="position:absolute; top:50%; left:50%; transform:translate(-50%, -50%); background:#161b22; padding:20px; border-radius:8px; border:1px solid #30363d; width:300px;">
+                <h3 style="margin-top:0;">✏️ {T('manage_cargo', 'ui', 'Manage Cargo')}</h3>
+                <form action="/update_hangar_item" method="post">
+                    <input type="hidden" id="edit_index" name="index">
+                    
+                    <div style="margin-bottom:10px; font-size:0.9rem; color:#aaa;">
+                        <span id="edit_loc"></span> - <span id="edit_mat"></span>
+                    </div>
+                    
+                    <label style="display:block; margin-bottom:5px;">{T('action', 'ui', 'Action')}:</label>
+                    <div style="display:flex; gap:10px; margin-bottom:10px;">
+                        <label style="cursor:pointer;"><input type="radio" name="action" value="update" checked onclick="toggleSaleFields(false)"> {T('update_qty', 'ui', 'Update Qty')}</label>
+                        <label style="cursor:pointer;"><input type="radio" name="action" value="sell" onclick="toggleSaleFields(true)"> {T('sell_remove', 'ui', 'Sell / Remove')}</label>
+                    </div>
+                    
+                    <div id="field_update">
+                        <label style="display:block; margin-bottom:5px;">{T('new_quantity', 'ui', 'New Total Quantity')}:</label>
+                        <input type="number" id="edit_qty_update" name="quantity" style="width:100%; margin-bottom:15px; background:#222; border:1px solid #444; color:#fff; padding:5px;">
+                    </div>
+                    
+                    <div id="field_sell" style="display:none;">
+                        <label style="display:block; margin-bottom:5px;">{T('remove_amount', 'ui', 'Amount to Remove')}:</label>
+                        <input type="number" id="edit_qty_sell" name="quantity" style="width:100%; margin-bottom:10px; background:#222; border:1px solid #444; color:#fff; padding:5px;" disabled>
+                        
+                        <label style="display:block; margin-bottom:5px;">{T('sale_value', 'ui', 'Sale Value (aUEC)')}:</label>
+                        <input type="number" name="value" placeholder="Optional" style="width:100%; margin-bottom:15px; background:#222; border:1px solid #444; color:#ffd700; padding:5px;">
+                    </div>
+                    
+                    <div style="display:flex; justify-content:flex-end; gap:10px;">
+                        <button type="button" onclick="document.getElementById('update_hangar_modal').style.display='none'" style="background:#444; color:#fff; border:none; padding:5px 10px; border-radius:4px; cursor:pointer;">{T('cancel', 'ui', 'Cancel')}</button>
+                        <button type="submit" class="btn" style="background:#00f2ff; color:#000;">💾 {T('save', 'ui', 'Save')}</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
         <!-- TRANSPORT MODAL -->
         <div id="transport_modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); z-index:1000;">
             <div style="position:absolute; top:50%; left:50%; transform:translate(-50%, -50%); background:#161b22; padding:20px; border-radius:8px; border:1px solid #30363d; width:300px;">
@@ -1502,7 +1642,7 @@ def hangar_page():
                     <input type="text" id="trans_mat" name="material" readonly style="width:100%; margin-bottom:10px; background:#222; color:#888;">
                     
                     <label style="display:block; margin-bottom:5px;">{T('quantity')} (SCU):</label>
-                    <input type="number" id="trans_qty" name="quantity" readonly style="width:100%; margin-bottom:10px; background:#222; color:#888;">
+                    <input type="number" id="trans_qty" name="quantity" style="width:100%; margin-bottom:10px; background:#222; border:1px solid #444; color:#fff; padding:5px;" required min="1">
                     
                     <label style="display:block; margin-bottom:5px;">{T('destination_ph', 'ui', 'Destination')}:</label>
                     <input type="text" name="destination" placeholder="e.g. Area18" style="width:100%; margin-bottom:15px;" required>
