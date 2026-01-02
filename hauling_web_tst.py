@@ -9,49 +9,6 @@ except ImportError:
     HAS_TRAY = False
 
 
-# --- LOG CAPTURE SYSTEM ---
-LOG_BUFFER = []
-MAX_LOG_LINES = 1000
-
-class LogCapture(object):
-    def __init__(self, original):
-        self.original = original
-        
-    def write(self, msg):
-        # Write to original stdout if it exists
-        if self.original:
-            try:
-                self.original.write(msg)
-                self.original.flush()
-            except:
-                pass
-        
-        # Append to buffer
-        if msg:
-            LOG_BUFFER.append(msg)
-            # Prune if too big
-            if len(LOG_BUFFER) > MAX_LOG_LINES * 2: 
-                del LOG_BUFFER[:MAX_LOG_LINES]
-
-    def flush(self):
-        if self.original:
-            try:
-                self.original.flush()
-            except:
-                pass
-
-# Redirect Stdout/Stderr
-if sys.stdout:
-    sys.stdout = LogCapture(sys.stdout)
-else:
-    sys.stdout = LogCapture(None)
-
-if sys.stderr:
-    sys.stderr = LogCapture(sys.stderr)
-else:
-    sys.stderr = LogCapture(None)
-
-
 # --- CONFIGURATION ---
 LOG_PATH = r"C:\Program Files\Roberts Space Industries\StarCitizen\LIVE\Game.log"
 WEB_PORT = 5000
@@ -115,11 +72,6 @@ def T(key, section='ui', default=None):
     return default if default is not None else key
 
 app = Flask(__name__)
-
-@app.route('/stream_logs')
-def stream_logs():
-    return jsonify({"logs": "".join(LOG_BUFFER)})
-
 
 def json_serial(obj):
     """JSON serializer for objects not serializable by default json code"""
@@ -1894,7 +1846,6 @@ def index():
         f"<div class='nav-header' style='display:flex; gap:10px; margin-bottom:10px;'>"
         f"    <a href='/' style='color:#fff; text-decoration:none; background:#238636; padding:5px 10px; border-radius:4px; font-weight:bold;'>📊 {T('dashboard', 'ui', 'Dashboard')}</a>"
         f"    <a href='/hangar' style='color:#58a6ff; text-decoration:none; padding:5px 10px;'>🏭 {T('hangar_local', 'ui', 'Hangar / Local Cargo')}</a>"
-        f"    <button onclick=\"openLogModal()\" style='background:none; border:1px solid #444; color:#aaa; cursor:pointer; padding:5px 10px; border-radius:4px;'>🖥️ {T('logs', 'ui', 'Logs')}</button>"
         f"</div>"
 
         f"<div class='loc-box'>📍 {T('current_location')}: {data_store['current_location']}</div>"
@@ -1903,7 +1854,6 @@ def index():
         "</div></div>"
         "<div class='header-right'>"
         f"<button id='pauseBtn' class='pause-btn' onclick='togglePauseManual()'>⏸ {T('pause')}</button>"
-        f"<button class='reset-btn' onclick='resetSession()'>♻ {T('reset_session', 'ui', 'Reset')}</button>"
         "</div>"
         "</div>"
         "<div class='info-grid'>"
@@ -2351,51 +2301,6 @@ def index():
     }, true);
     
     setInterval(updateContent, {{ REFRESH_INTERVAL_MS }});
-    </script>
-    
-    <!-- LOG MODAL -->
-    <div id="logModal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); z-index:9999;">
-        <div style="position:relative; width:90%; height:90%; margin:2% auto; background:#000; border:1px solid #333; border-radius:5px; padding:10px; display:flex; flex-direction:column;">
-            <div style="display:flex; justify-content:space-between; margin-bottom:10px;">
-                <span style="color:#0f0; font-family:monospace; font-weight:bold;">>_ TERMINAL OUTPUT</span>
-                <button onclick="closeLogModal()" style="background:#333; color:#fff; border:none; padding:5px 10px; cursor:pointer;">X</button>
-            </div>
-            <pre id="logContent" style="flex:1; overflow-y:auto; color:#ccc; font-family:monospace; font-size:0.8rem; margin:0; white-space:pre-wrap;"></pre>
-        </div>
-    </div>
-
-    <script>
-    var logInterval = null;
-
-    function openLogModal() {
-        document.getElementById('logModal').style.display = 'block';
-        fetchLogs();
-        logInterval = setInterval(fetchLogs, 1000);
-    }
-
-    function closeLogModal() {
-        document.getElementById('logModal').style.display = 'none';
-        if (logInterval) clearInterval(logInterval);
-    }
-
-    async function fetchLogs() {
-        try {
-            const res = await fetch('/stream_logs');
-            const data = await res.json();
-            const el = document.getElementById('logContent');
-            
-            // Auto scroll only if we are already near bottom or it's first load
-            const isScrolledToBottom = el.scrollHeight - el.clientHeight <= el.scrollTop + 50;
-            
-            el.textContent = data.logs;
-            
-            if (isScrolledToBottom) {
-                el.scrollTop = el.scrollHeight;
-            }
-        } catch(e) {
-            console.error(e);
-        }
-    }
     </script>
     </div></body></html>"""
     return render_template_string(html, REFRESH_INTERVAL_MS=REFRESH_INTERVAL_MS)
