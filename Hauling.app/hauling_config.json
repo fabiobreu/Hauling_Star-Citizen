@@ -1,1 +1,29 @@
-{"api_key": "AIzaSyCnSY0NOVuvTnUQh4ggQBdUI6IWesxK19Q", "model_name": "gemini-2.0-flash"}
+{
+  "log_path": "C:/Program Files/Roberts Space Industries/StarCitizen/LIVE/Game.log",
+  "web_port": 5000,
+  "web_host": "0.0.0.0",
+  "refresh_interval_ms": 2000,
+  "language": "en",
+  "patterns": {
+    "notification_event": "<SHUDEvent_OnNotification>",
+    "mission_id_tag": "MissionId:",
+    "notif_id_regex": "Added notification \".*?\" \\[([0-9]+)\\]",
+    "mission_id_regex": "MissionId:\\s*\\[([a-f0-9\\-]+)\\]",
+    "notif_text_regex": "Added notification \"(.*?)\"",
+    "contract_accepted": "Contract Accepted",
+    "contract_accepted_regex": "Contract Accepted:\\s*(.+?)(?::|\"|\\[|$)",
+    "new_objective": "New Objective",
+    "objective_complete": "Objective Complete",
+    "scu_regex": "(Deliver|Pickup|Dropoff|Transport|Collect)\\s+(\\d+)(?:[/\\s]+(\\d+))?\\s+SCU\\s+(?:of|de)?\\s*([A-Za-z0-9\\s\\(\\)\\-\\.]+?)\\s+(?:to|at|for|towards|para|em|de)\\s+([A-Za-z0-9\\s\\(\\)\\-\\.]+?)(?::|\"|\\[|$)",
+    "generic_regex": "(Deliver|Pickup|Collect)\\s+(.+?)\\s+(?:to|at|from|para|de)\\s+([A-Za-z0-9\\s\\-\\.]+?)(?::|\"|\\[|$)",
+    "marker_event": "<CLocalMissionPhaseMarker::CreateMarker>",
+    "marker_contract_tag": "contract [",
+    "marker_mission_id_regex": "missionId \\[([a-f0-9\\-]+)\\]",
+    "marker_contract_regex": "contract \\[([a-zA-Z0-9_]+)\\]",
+    "inventory_event": "Inventory Result Item Count",
+    "inventory_count_regex": "Item Count:\\[(\\d+)\\]",
+    "ui_notif_event": "<UpdateNotificationItem>",
+    "ui_notif_tag": "Notification",
+    "ui_notif_id_regex": "Notification \".*?\" \\[(\\d+)\\]"
+  }
+}
