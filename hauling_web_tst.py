@@ -495,6 +495,62 @@ class HaulingMonitor:
                         del data_store["missions"][mission_id]
                     save_state()
 
+                # 1.6 Contract Complete (Specific Handling for Salvage/Special Missions)
+                elif "Contract Complete" in notification_text:
+                    title_match = re.search(r'Contract Complete:\s*(.+?)(?::|\"|\[|$)', notification_text)
+                    title = title_match.group(1).strip() if title_match else "Unknown Contract"
+                    
+                    # SALVAGE MISSION DETECTION
+                    # Keywords: Salvage Rights, Recycling, Claim, Unverified
+                    if any(k in title for k in ["Salvage Rights", "Recycling", "Claim", "Unverified"]):
+                        print(f"♻️ Salvage Mission Complete: {title}")
+                        
+                        # 1. Add to Hangar (Always, as requested by user)
+                        if "hangar" not in data_store: data_store["hangar"] = []
+                        data_store["hangar"].append({
+                            "loc": T('unknown_location', 'ui', 'Unknown Location (Edit)'),
+                            "mat": T('salvage_material', 'ui', 'Salvage Material (Edit)'),
+                            "qty": 0,
+                            "added": time.strftime("%H:%M:%S")
+                        })
+                        print(f"🏭 Added Salvage to Hangar: {title}")
+                        
+                        # 2. Handle History
+                        # Check if we have an active mission with this title or ID
+                        found_active = False
+                        if mission_id and mission_id in data_store["missions"]:
+                             found_active = True
+                             self.archive_specific_mission(mission_id)
+                        else:
+                             # Try title match
+                             for mid, mdata in list(data_store["missions"].items()):
+                                 if mdata["title"] == title:
+                                     found_active = True
+                                     self.archive_specific_mission(mid)
+                                     break
+                        
+                        if not found_active:
+                            # Create synthetic history entry if not found active
+                             hist_id = mission_id if mission_id else f"SALVAGE_{int(time.time())}"
+                             
+                             # Idempotency Check
+                             if hist_id not in data_store.get("processed_mission_ids", []):
+                                 hist_entry = {
+                                    "id": hist_id,
+                                    "title": title,
+                                    "items": { "1": { "mat": "Salvage", "dest": "Hangar", "vol": 0, "status": "COMPLETED", "type": "SALVAGE" } },
+                                    "started": time.strftime("%H:%M:%S"),
+                                    "time": time.strftime("%H:%M:%S"),
+                                    "status": "COMPLETED",
+                                    "value": 0 # Unknown value until user inputs
+                                }
+                                 if "finished_missions" not in data_store: data_store["finished_missions"] = []
+                                 data_store["finished_missions"].insert(0, hist_entry)
+                                 
+                                 if "processed_mission_ids" not in data_store: data_store["processed_mission_ids"] = []
+                                 data_store["processed_mission_ids"].append(hist_id)
+                                 save_state()
+
                 # 2. New Objective / Objective Complete
                 elif PATTERNS["new_objective"] in notification_text or PATTERNS["objective_complete"] in notification_text:
                     
