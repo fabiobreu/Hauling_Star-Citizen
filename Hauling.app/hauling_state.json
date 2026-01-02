@@ -1,0 +1,26 @@
+{
+  "missions": {},
+  "finished_missions": [
+    {
+      "id": "dfe2b1ca-eb38-4837-8aa5-f0a895ed2cdc",
+      "title": "Claim #91888",
+      "items": {},
+      "value": 0,
+      "started": "17:22:38",
+      "time": "17:22:38",
+      "source": "LOG",
+      "status": "COMPLETED"
+    }
+  ],
+  "hangar": [],
+  "player_name": "Lolindirarfar",
+  "ship_name": "RSI SALVATION",
+  "current_location": "Everus Harbor",
+  "next_destination": "None",
+  "fuel_estimate": 0,
+  "mission_status": "ACTIVE",
+  "session_start": "2026-01-02T17:22:38.280424",
+  "processed_mission_ids": [
+    "dfe2b1ca-eb38-4837-8aa5-f0a895ed2cdc"
+  ]
+}

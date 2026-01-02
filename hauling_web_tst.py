@@ -1,6 +1,56 @@
-import os, time, re, threading, json, sys
+import os, time, re, threading, json, sys, webbrowser
 from flask import Flask, render_template_string, request, jsonify
 from datetime import datetime, timedelta
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+    HAS_TRAY = True
+except ImportError:
+    HAS_TRAY = False
+
+
+# --- LOG CAPTURE SYSTEM ---
+LOG_BUFFER = []
+MAX_LOG_LINES = 1000
+
+class LogCapture(object):
+    def __init__(self, original):
+        self.original = original
+        
+    def write(self, msg):
+        # Write to original stdout if it exists
+        if self.original:
+            try:
+                self.original.write(msg)
+                self.original.flush()
+            except:
+                pass
+        
+        # Append to buffer
+        if msg:
+            LOG_BUFFER.append(msg)
+            # Prune if too big
+            if len(LOG_BUFFER) > MAX_LOG_LINES * 2: 
+                del LOG_BUFFER[:MAX_LOG_LINES]
+
+    def flush(self):
+        if self.original:
+            try:
+                self.original.flush()
+            except:
+                pass
+
+# Redirect Stdout/Stderr
+if sys.stdout:
+    sys.stdout = LogCapture(sys.stdout)
+else:
+    sys.stdout = LogCapture(None)
+
+if sys.stderr:
+    sys.stderr = LogCapture(sys.stderr)
+else:
+    sys.stderr = LogCapture(None)
+
 
 # --- CONFIGURATION ---
 LOG_PATH = r"C:\Program Files\Roberts Space Industries\StarCitizen\LIVE\Game.log"
@@ -65,6 +115,11 @@ def T(key, section='ui', default=None):
     return default if default is not None else key
 
 app = Flask(__name__)
+
+@app.route('/stream_logs')
+def stream_logs():
+    return jsonify({"logs": "".join(LOG_BUFFER)})
+
 
 def json_serial(obj):
     """JSON serializer for objects not serializable by default json code"""
@@ -1839,6 +1894,7 @@ def index():
         f"<div class='nav-header' style='display:flex; gap:10px; margin-bottom:10px;'>"
         f"    <a href='/' style='color:#fff; text-decoration:none; background:#238636; padding:5px 10px; border-radius:4px; font-weight:bold;'>📊 {T('dashboard', 'ui', 'Dashboard')}</a>"
         f"    <a href='/hangar' style='color:#58a6ff; text-decoration:none; padding:5px 10px;'>🏭 {T('hangar_local', 'ui', 'Hangar / Local Cargo')}</a>"
+        f"    <button onclick=\"openLogModal()\" style='background:none; border:1px solid #444; color:#aaa; cursor:pointer; padding:5px 10px; border-radius:4px;'>🖥️ {T('logs', 'ui', 'Logs')}</button>"
         f"</div>"
 
         f"<div class='loc-box'>📍 {T('current_location')}: {data_store['current_location']}</div>"
@@ -2296,6 +2352,51 @@ def index():
     
     setInterval(updateContent, {{ REFRESH_INTERVAL_MS }});
     </script>
+    
+    <!-- LOG MODAL -->
+    <div id="logModal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); z-index:9999;">
+        <div style="position:relative; width:90%; height:90%; margin:2% auto; background:#000; border:1px solid #333; border-radius:5px; padding:10px; display:flex; flex-direction:column;">
+            <div style="display:flex; justify-content:space-between; margin-bottom:10px;">
+                <span style="color:#0f0; font-family:monospace; font-weight:bold;">>_ TERMINAL OUTPUT</span>
+                <button onclick="closeLogModal()" style="background:#333; color:#fff; border:none; padding:5px 10px; cursor:pointer;">X</button>
+            </div>
+            <pre id="logContent" style="flex:1; overflow-y:auto; color:#ccc; font-family:monospace; font-size:0.8rem; margin:0; white-space:pre-wrap;"></pre>
+        </div>
+    </div>
+
+    <script>
+    var logInterval = null;
+
+    function openLogModal() {
+        document.getElementById('logModal').style.display = 'block';
+        fetchLogs();
+        logInterval = setInterval(fetchLogs, 1000);
+    }
+
+    function closeLogModal() {
+        document.getElementById('logModal').style.display = 'none';
+        if (logInterval) clearInterval(logInterval);
+    }
+
+    async function fetchLogs() {
+        try {
+            const res = await fetch('/stream_logs');
+            const data = await res.json();
+            const el = document.getElementById('logContent');
+            
+            // Auto scroll only if we are already near bottom or it's first load
+            const isScrolledToBottom = el.scrollHeight - el.clientHeight <= el.scrollTop + 50;
+            
+            el.textContent = data.logs;
+            
+            if (isScrolledToBottom) {
+                el.scrollTop = el.scrollHeight;
+            }
+        } catch(e) {
+            console.error(e);
+        }
+    }
+    </script>
     </div></body></html>"""
     return render_template_string(html, REFRESH_INTERVAL_MS=REFRESH_INTERVAL_MS)
 
@@ -2312,13 +2413,77 @@ if __name__ == '__main__':
     print("=" * 60)
     print("🚀 STAR CITIZEN HAULING MONITOR - HYBRID MODE")
     print("=" * 60)
-    print(f"📊 {T('dashboard', 'ui')}: http://{WEB_HOST}:{WEB_PORT}")
+    
+    dashboard_url = f"http://{WEB_HOST if WEB_HOST != '0.0.0.0' else 'localhost'}:{WEB_PORT}"
+    
+    print(f"📊 {T('dashboard', 'ui')}: {dashboard_url}")
     print(f"⏰ {T('session_started', 'ui')}: {data_store['session_start'].strftime('%H:%M:%S')}")
     print(f"📖 {T('log_monitoring', 'ui')}: ENABLED")
     
-
-    
     print("=" * 60)
     
+    # Start Log Reader in Background
     threading.Thread(target=background_log_reader, daemon=True).start()
-    app.run(host=WEB_HOST, port=WEB_PORT, debug=False)
+    
+    # Function to run Flask
+    def run_flask():
+        app.run(host=WEB_HOST, port=WEB_PORT, debug=False, use_reloader=False)
+
+    if HAS_TRAY:
+        # --- SYSTEM TRAY IMPLEMENTATION ---
+        import ctypes
+        
+        def create_image():
+            # Generate a simple icon (Blue box with 'H')
+            width = 64
+            height = 64
+            color1 = (0, 242, 255) # Cyan
+            color2 = (13, 17, 23)  # Dark BG
+            
+            image = Image.new('RGB', (width, height), color2)
+            dc = ImageDraw.Draw(image)
+            dc.rectangle((0, 0, width, height), fill=color2)
+            dc.rectangle((10, 10, width-10, height-10), fill=color1)
+            
+            return image
+
+        def on_open(icon, item):
+            webbrowser.open(dashboard_url)
+            
+        def on_toggle_terminal(icon, item):
+            hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+            if hwnd:
+                user32 = ctypes.windll.user32
+                if user32.IsWindowVisible(hwnd):
+                    user32.ShowWindow(hwnd, 0) # SW_HIDE
+                else:
+                    user32.ShowWindow(hwnd, 5) # SW_SHOW
+                    user32.SetForegroundWindow(hwnd)
+
+        def on_exit(icon, item):
+            icon.stop()
+            os._exit(0)
+
+        # Create Icon
+        image = create_image()
+        menu = pystray.Menu(
+            pystray.MenuItem("🖥️ Terminal", on_toggle_terminal),
+            pystray.MenuItem(T('open_dashboard', 'ui', 'Open Dashboard'), on_open, default=True),
+            pystray.MenuItem(T('exit', 'ui', 'Exit'), on_exit)
+        )
+        
+        icon = pystray.Icon("HaulingMonitor", image, "Hauling Monitor", menu)
+        
+        # Start Flask in a Daemon Thread so it dies when main thread (Icon) dies
+        flask_thread = threading.Thread(target=run_flask, daemon=True)
+        flask_thread.start()
+        
+        print("🖥️ System Tray Icon started. Check your taskbar.")
+        
+        # Run Tray (Blocking)
+        icon.run()
+        
+    else:
+        # Fallback if no pystray (or regular console mode desired)
+        print("⚠️ System Tray not available (pystray missing). Running in console mode.")
+        run_flask()
