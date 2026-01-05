@@ -182,8 +182,18 @@ def load_state():
     global data_store
     if os.path.exists(STATE_FILE):
         try:
+            # Check if file is empty
+            if os.path.getsize(STATE_FILE) == 0:
+                 print(f"⚠ State file {STATE_FILE} is empty. Starting fresh.")
+                 return
+
             with open(STATE_FILE, 'r', encoding='utf-8') as f:
                 saved = json.load(f)
+                
+                # SAFETY CHECK: Ensure saved data is a dictionary
+                if not isinstance(saved, dict):
+                    print(f"⚠ Invalid state format in {STATE_FILE} (expected dict, got {type(saved).__name__}). Starting fresh.")
+                    return
                 
                 # Restore datetime objects
                 if 'session_start' in saved:
