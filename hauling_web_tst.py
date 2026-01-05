@@ -1,6 +1,6 @@
-import os, time, re, threading, json, sys, webbrowser
+import os, time, re, threading, json, sys, webbrowser, signal
 from flask import Flask, render_template_string, request, jsonify
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 try:
     import pystray
     from PIL import Image, ImageDraw
@@ -50,6 +50,7 @@ else:
 CONFIG_FILE = os.path.join(BASE_DIR, 'hauling_config.json')
 
 STATE_FILE = os.path.join(BASE_DIR, 'hauling_state.json')
+FINISH_FILE = os.path.join(BASE_DIR, 'hauling_finish.json')
 LANG_DATA = {}
 
 def load_language_data():
@@ -71,6 +72,42 @@ def T(key, section='ui', default=None):
         return LANG_DATA[section][key]
     return default if default is not None else key
 
+def get_container_breakdown(vol, max_size=32):
+    """Calculates the optimal container distribution for a given volume"""
+    if not vol or vol <= 0: return ""
+    
+    # Available sizes based on max_size
+    all_sizes = [32, 16, 8, 4, 2, 1]
+    
+    # Filter sizes that are <= max_size
+    try:
+        max_size = int(max_size)
+    except:
+        max_size = 32
+        
+    sizes = [s for s in all_sizes if s <= max_size]
+    
+    breakdown = []
+    remaining = vol
+    
+    for size in sizes:
+        count = remaining // size
+        if count > 0:
+            breakdown.append((count, size))
+            remaining %= size
+            
+    html_parts = []
+    for count, size in breakdown:
+        # Style: Count (Gray), Size (Purple)
+        html_parts.append(
+            f"<span style='display:inline-flex; align-items:center; margin-right:4px; border:1px solid #444; border-radius:3px; overflow:hidden;'>"
+            f"<span style='background:#333; color:#ccc; padding:1px 5px; font-family:monospace; font-size:0.8rem; font-weight:bold;'>{count}</span>"
+            f"<span style='background:#7c4dff; color:#fff; padding:1px 5px; font-family:monospace; font-size:0.8rem; font-weight:bold;'>{size}</span>"
+            f"</span>"
+        )
+        
+    return "".join(html_parts)
+
 app = Flask(__name__)
 
 def json_serial(obj):
@@ -82,16 +119,63 @@ def json_serial(obj):
     raise TypeError(f"Type {type(obj)} not serializable")
 
 def save_state():
-    """Save current data_store to disk"""
-    try:
-        # Ensure processed_mission_ids is preserved
-        if "processed_mission_ids" not in data_store:
-            data_store["processed_mission_ids"] = []
+        """Save current data_store to disk"""
+        try:
+            # Ensure processed_mission_ids is preserved
+            if "processed_mission_ids" not in data_store:
+                data_store["processed_mission_ids"] = []
 
-        with open(STATE_FILE, 'w', encoding='utf-8') as f:
-            json.dump(data_store, f, default=json_serial, indent=2)
+            # Create a clean copy to save
+            to_save = data_store.copy()
+            
+            # DO NOT save the persistent history into the volatile state file
+            if "finished_fixed" in to_save:
+                del to_save["finished_fixed"]
+            
+            # DEPRECATED: finished_missions should not be used anymore
+            if "finished_missions" in to_save:
+                del to_save["finished_missions"]
+
+            with open(STATE_FILE, 'w', encoding='utf-8') as f:
+                json.dump(to_save, f, default=json_serial, indent=2)
+        except Exception as e:
+            print(f"⚠ Failed to save state: {e}")
+
+def load_finishes():
+    try:
+        if os.path.exists(FINISH_FILE):
+            with open(FINISH_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
     except Exception as e:
-        print(f"⚠ Failed to save state: {e}")
+        print(f"⚠ Failed to load finish file: {e}")
+    return []
+
+def save_finishes(items):
+    try:
+        with open(FINISH_FILE, 'w', encoding='utf-8') as f:
+            json.dump(items, f, indent=2)
+    except Exception as e:
+        print(f"⚠ Failed to save finish file: {e}")
+
+def append_finish(entry):
+    items = load_finishes()
+    existing_idx = next((i for i, it in enumerate(items) if it.get("id") == entry.get("id")), None)
+    if existing_idx is not None:
+        items.pop(existing_idx)
+    items.insert(0, entry)
+    save_finishes(items)
+
+def update_finish_value(mid, new_value):
+    items = load_finishes()
+    updated = False
+    for it in items:
+        if it.get("id") == mid:
+            it["value"] = new_value
+            updated = True
+            break
+    if updated:
+        save_finishes(items)
+    return updated
 
 def load_state():
     """Load data_store from disk"""
@@ -141,29 +225,19 @@ def load_state():
                 if "processed_mission_ids" not in data_store:
                     data_store["processed_mission_ids"] = []
                 
-                # ALWAYS Sync: Ensure all currently finished missions are in the processed list
-                # This fixes issues where the list might be empty but history exists (e.g. from backup or old version)
-                count_synced = 0
-                for m in data_store.get("finished_missions", []):
-                    if "id" in m and m["id"] not in data_store["processed_mission_ids"]:
-                        data_store["processed_mission_ids"].append(m["id"])
-                        count_synced += 1
-                
-                if count_synced > 0:
-                    print(f"✓ History Sync: Added {count_synced} existing history items to duplicate blocklist.")
-                    # Save immediately to persist the sync
-                    try:
-                        with open(STATE_FILE, 'w', encoding='utf-8') as f:
-                            json.dump(data_store, f, default=json_serial, indent=2)
-                    except: pass
+                # CLEANUP: Remove deprecated finished_missions if accidentally loaded
+                if "finished_missions" in data_store:
+                    del data_store["finished_missions"]
 
                 print(f"✓ State loaded from {STATE_FILE} (Session: {saved['session_start'].strftime('%H:%M')})")
         except Exception as e:
             print(f"⚠ Failed to load state: {e}")
+    # Always refresh fixed finishes in memory
+    data_store["finished_fixed"] = load_finishes()
 
 data_store = {
     "missions": {}, 
-    "finished_missions": [],
+    "finished_fixed": [],
     "hangar": [],
     "player_name": "Waiting for Login...", 
     "ship_name": "Waiting for Ship...",
@@ -365,8 +439,8 @@ class HaulingMonitor:
         if "time" not in data_store["missions"][stale_id]:
              data_store["missions"][stale_id]["time"] = time.strftime("%H:%M:%S")
         
-        # Move to history
-        data_store["finished_missions"].insert(0, data_store["missions"][stale_id])
+        # Move to persistent history ONLY
+        append_finish(data_store["missions"][stale_id])
         
         # CRITICAL: Add to processed_mission_ids IMMEDIATELY to prevent Log Reader from re-adding it
         if "processed_mission_ids" not in data_store:
@@ -550,9 +624,10 @@ class HaulingMonitor:
                                     "time": time.strftime("%H:%M:%S"),
                                     "status": "COMPLETED",
                                     "value": 0 # Unknown value until user inputs
-                                }
+                                 }
                                  if "finished_missions" not in data_store: data_store["finished_missions"] = []
                                  data_store["finished_missions"].insert(0, hist_entry)
+                                 append_finish(hist_entry)
                                  
                                  if "processed_mission_ids" not in data_store: data_store["processed_mission_ids"] = []
                                  data_store["processed_mission_ids"].append(hist_id)
@@ -1016,7 +1091,7 @@ class HaulingMonitor:
                 if comp_type == "SUCCESS":
                         # Archive to history
                         mission_data = data_store["missions"][m_id]
-                        data_store["finished_missions"].insert(0, {
+                        finished_entry = {
                             "id": m_id,
                             "title": mission_data.get("title", T('unknown_mission', 'ui', 'Unknown Mission')),
                             "items": mission_data.get("items", {}).copy(),
@@ -1025,7 +1100,10 @@ class HaulingMonitor:
                             "time": time.strftime("%H:%M:%S"),
                             "source": "LOG",
                             "status": "COMPLETED"
-                        })
+                        }
+                        # Persist to finish file ONLY
+                        append_finish(finished_entry)
+                        
                         del data_store["missions"][m_id]
                         
                         # Mark as processed
@@ -1040,7 +1118,8 @@ class HaulingMonitor:
                     mission_data = data_store["missions"][m_id]
                     status_label = "CANCELLED" if comp_type in ["ABANDON", "ABANDONED"] else "FAILED"
                     
-                    data_store["finished_missions"].insert(0, {
+                    # Persist to finish file ONLY
+                    append_finish({
                         "id": m_id,
                         "title": mission_data.get("title", T('unknown_mission', 'ui', 'Unknown Mission')),
                         "items": mission_data.get("items", {}).copy(),
@@ -1073,15 +1152,27 @@ class HaulingMonitor:
                 # Update the most recent finished mission if it exists
                 # STRATEGY: Find the most recent mission with NO reward (value=0) and fill it.
                 # This handles batch completions (e.g. 4 missions finish, then 4 rewards come).
-                if data_store["finished_missions"]:
+                # Use persistent history to ensure we find it even after restart
+                history_source = data_store.get("finished_fixed", [])
+                
+                if history_source:
                     assigned = False
                     # Check the last 10 finished missions
-                    for i in range(min(10, len(data_store["finished_missions"]))):
-                        mission = data_store["finished_missions"][i]
+                    for i in range(min(10, len(history_source))):
+                        mission = history_source[i]
                         # If mission has no value or value is 0, assign it
                         if not mission.get("value"):
+                            # HEURISTIC: Prevent assigning massive rewards to small/starter missions
+                            # This prevents a 1M+ reward (likely a balance glitch or untracked mission) 
+                            # from being assigned to a "Junior Rank" mission.
+                            title_upper = mission.get('title', '').upper()
+                            if amount > 500000 and ("JUNIOR" in title_upper or "SMALL" in title_upper or "LOCAL" in title_upper):
+                                 print(f"⚠️ {T('source_log', 'ui')}: {T('reward_skip', 'log', 'Skipping assignment of large reward')} ({amount}) {T('to_small_mission', 'log', 'to small mission')}: {mission['title']}")
+                                 continue
+
                             mission["value"] = amount
                             print(f"💰 {T('source_log', 'ui')}: {T('reward_detected', 'log')}: {amount} aUEC -> {mission['title']} ({mission['id']})")
+                            update_finish_value(mission.get("id"), mission["value"])
                             assigned = True
                             break
                     
@@ -1089,12 +1180,37 @@ class HaulingMonitor:
                         # If all recent missions have rewards, check for duplicates.
                         # If amount matches the most recent one, assume duplicate log and ignore.
                         # If amount is different, maybe it's a bonus? Add to the most recent one.
-                        last_mission = data_store["finished_missions"][0]
+                        last_mission = history_source[0]
                         if last_mission.get("value") == amount:
                              print(f"💰 {T('source_log', 'ui')}: {T('reward_detected', 'log')}: {amount} aUEC (Duplicate/Ignored)")
-                        else:
+                        
+                        # Only merge as bonus if the new amount is SMALL (likely a bonus)
+                        # If new amount is larger than existing, assume it's a separate untracked reward.
+                        elif amount < last_mission.get("value", 0) and amount < 500000:
                              last_mission["value"] = last_mission.get("value", 0) + amount
+                             update_finish_value(last_mission.get("id"), last_mission["value"])
                              print(f"💰 {T('source_log', 'ui')}: {T('reward_detected', 'log')}: +{amount} aUEC -> {last_mission['title']} (Bonus)")
+                        
+                        else:
+                             # Create Orphan Reward Entry
+                             print(f"💰 {T('source_log', 'ui')}: {T('reward_detected', 'log')}: {amount} aUEC (Orphan/New)")
+                             orphan_entry = {
+                                "id": f"REWARD_{int(time.time())}",
+                                "title": f"💰 {T('reward', 'ui', 'Reward')} ({amount} aUEC)",
+                                "items": {},
+                                "value": amount,
+                                "started": time.strftime("%H:%M:%S"),
+                                "time": time.strftime("%H:%M:%S"),
+                                "status": "COMPLETED",
+                                "source": "LOG (Reward)"
+                             }
+                             history_source.insert(0, orphan_entry)
+                             append_finish(orphan_entry)
+                             if "processed_mission_ids" not in data_store: data_store["processed_mission_ids"] = []
+                             data_store["processed_mission_ids"].append(orphan_entry["id"])
+
+                    # Sync back to data_store to reflect changes in UI immediately
+                    data_store["finished_fixed"] = history_source
 
                     save_state()
 
@@ -1124,7 +1240,7 @@ def background_log_reader():
         ts_regex = re.compile(r'<(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})')
         
         # Calculate cutoff time (e.g. 12 hours ago)
-        cutoff_time = datetime.utcnow() - timedelta(hours=12)
+        cutoff_time = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=12)
 
         while True:
             line = f.readline()
@@ -1156,16 +1272,27 @@ def manual_add_item():
     mats = request.form.getlist('material')
     qtys = request.form.getlist('quantity')
     dests = request.form.getlist('destination')
+    origins = request.form.getlist('origin') # Optional origins
     
     if m_id and m_id in data_store["missions"]:
         # Zip inputs to handle multiple rows
         # We use zip_longest or just zip if we assume UI sends consistent arrays
         # Since these are simple inputs, they should align.
         
-        for i in range(len(mats)):
+        # Ensure origins list matches length (it might be shorter if not all rows have it, 
+        # but HTML forms usually send empty strings for empty inputs if they are named correctly in the loop)
+        # Actually, getlist returns all values. If the input is in every row, we get equal length.
+        
+        count = len(mats)
+        # Pad origins if necessary (though HTML usually sends empty string)
+        while len(origins) < count:
+            origins.append("")
+
+        for i in range(count):
             mat = mats[i]
             qty = qtys[i]
             dest = dests[i]
+            origin = origins[i] if i < len(origins) else ""
             
             if mat and qty and dest:
                 try:
@@ -1173,7 +1300,22 @@ def manual_add_item():
                     mat = mat.upper().strip()
                     dest = clean_location_name(dest)
                     
-                    # Create a DELIVERY item
+                    # 1. Create PICKUP item if origin is specified
+                    if origin and origin.strip():
+                        clean_origin = clean_location_name(origin)
+                        pickup_key = f"{mat}_{clean_origin}_PICKUP_{int(time.time())}_{i}"
+                        data_store["missions"][m_id]["items"][pickup_key] = {
+                            "mat": mat,
+                            "dest": clean_origin, # Destination for the pickup action (where we go to pick up)
+                            "vol": vol,
+                            "delivered": 0,
+                            "status": "PENDING",
+                            "type": "PICKUP",
+                            "action": "MANUAL_ADD"
+                        }
+                        print(f"✏️ {T('manual_add', 'log')}: {T('pickup')} {vol} {mat} @ {clean_origin}")
+
+                    # 2. Create DELIVERY item
                     item_key = f"{mat}_{dest}_DELIVERY_{int(time.time())}_{i}"
                     
                     data_store["missions"][m_id]["items"][item_key] = {
@@ -1259,8 +1401,8 @@ def force_complete_item():
 def delete_history(history_index):
     try:
         idx = int(history_index)
-        if 0 <= idx < len(data_store["finished_missions"]):
-            removed = data_store["finished_missions"][idx]
+        if 0 <= idx < len(data_store.get("finished_fixed", [])):
+            removed = data_store["finished_fixed"][idx]
             
             # Ensure ID is in processed_mission_ids so it doesn't reappear from logs
             if "processed_mission_ids" not in data_store: 
@@ -1269,7 +1411,10 @@ def delete_history(history_index):
             if "id" in removed and removed["id"] not in data_store["processed_mission_ids"]:
                 data_store["processed_mission_ids"].append(removed["id"])
                 
-            data_store["finished_missions"].pop(idx)
+            items = load_finishes()
+            items = [it for it in items if it.get("id") != removed.get("id")]
+            save_finishes(items)
+            data_store["finished_fixed"] = items
             print(f"🗑️ {T('history_delete', 'log')}: {removed.get('title', 'Mission')}")
             save_state()
     except:
@@ -1336,7 +1481,7 @@ def update_hangar_item():
                         item['qty'] -= q
                         # Record history
                         if "finished_missions" not in data_store: data_store["finished_missions"] = []
-                        data_store["finished_missions"].insert(0, {
+                        entry = {
                             "id": f"SALE_{int(time.time())}",
                             "title": f"💰 Sold: {item['mat']} ({q} SCU)",
                             "value": int(value) if value else 0,
@@ -1349,7 +1494,9 @@ def update_hangar_item():
                                     "vol": q
                                 }
                             }
-                        })
+                        }
+                        data_store["finished_missions"].insert(0, entry)
+                        append_finish(entry)
                         print(f"💰 Sold {q} SCU of {item['mat']} at {item['loc']}")
                         
                 else: # 'update'
@@ -1419,7 +1566,7 @@ def complete_manifest():
                 
                 # Add to history
                 if "finished_missions" not in data_store: data_store["finished_missions"] = []
-                data_store["finished_missions"].insert(0, {
+                entry = {
                     "id": f"PRIVATE_{int(time.time())}",
                     "title": f"📦 Sale: {item['mat']} ({item['qty']} SCU)",
                     "value": int(profit),
@@ -1432,7 +1579,9 @@ def complete_manifest():
                             "vol": item["qty"]
                         }
                     }
-                })
+                }
+                data_store["finished_missions"].insert(0, entry)
+                append_finish(entry)
                 print(f"💰 Sold: {item['mat']} for {profit} aUEC")
                 save_state()
         except ValueError:
@@ -1456,6 +1605,31 @@ def delete_manifest(index):
         save_state()
     return '<meta http-equiv="refresh" content="0;url=/hangar">'
 
+@app.route('/finish_update', methods=['POST'])
+def finish_update():
+    mid = request.form.get('id')
+    val = request.form.get('value')
+    try:
+        v = int(val)
+    except:
+        v = None
+    if mid and v is not None:
+        update_finish_value(mid, v)
+        data_store["finished_fixed"] = load_finishes()
+    return '<meta http-equiv="refresh" content="0;url=/">'
+
+@app.route('/finish_delete/<mid>')
+def finish_delete(mid):
+    items = load_finishes()
+    items = [it for it in items if it.get("id") != mid]
+    save_finishes(items)
+    data_store["finished_fixed"] = items
+    if "processed_mission_ids" not in data_store:
+        data_store["processed_mission_ids"] = []
+    if mid not in data_store["processed_mission_ids"]:
+        data_store["processed_mission_ids"].append(mid)
+    save_state()
+    return '<meta http-equiv="refresh" content="0;url=/">'
 @app.route('/reset_session', methods=['POST'])
 def reset_session():
     global data_store
@@ -1723,12 +1897,29 @@ def hangar_page():
     """
     return html
 
+@app.route('/update_container_size', methods=['POST'])
+def update_container_size():
+    m_id = request.form.get('mission_id')
+    size = request.form.get('max_size')
+    
+    if m_id and m_id in data_store["missions"]:
+        data_store["missions"][m_id]["max_container_size"] = int(size)
+        save_state()
+        
+    # If no specific mission ID (e.g. aggregated view), we might need to update all missions for that material/dest?
+    # For simplicity, the UI will send the "representative" mission ID.
+    
+    return '<meta http-equiv="refresh" content="0;url=/">'
+
 @app.route('/')
 def index():
     # AGGREGATION LOGIC
     summary = {}
     
     for m_id, m_data in data_store["missions"].items():
+        # Get max container size for this mission (default 32)
+        max_size = m_data.get("max_container_size", 32)
+        
         for item in m_data["items"].values():
             d, m, v, status = item["dest"], item["mat"], item["vol"], item["status"]
             delivered = item.get("delivered", 0)
@@ -1745,13 +1936,16 @@ def index():
                     "delivered_pickup": 0,
                     "delivered_delivery": 0,
                     "mission_ids": set(),
-                    "all_items_completed": True
+                    "all_items_completed": True,
+                    "max_size": max_size # Store preference
                 }
             
             summary[d][m]["mission_ids"].add(m_id)
             
             # Check individual item completion
-            if status != "COMPLETED":
+            # REFINED LOGIC: Pickup items do NOT block mission completion.
+            # Only DELIVERY items must be completed.
+            if i_type != "PICKUP" and status != "COMPLETED":
                 summary[d][m]["all_items_completed"] = False
 
             # Sum up volumes based on type
@@ -1763,7 +1957,7 @@ def index():
                 summary[d][m]["delivered_delivery"] += delivered
             
             # Status check:
-            # 1. If explicitly all items are COMPLETED, then COMPLETED.
+            # 1. If explicitly all items (excluding pickups) are COMPLETED, then COMPLETED.
             # 2. OR if delivery count is satisfied (fallback)
             if summary[d][m]["all_items_completed"]:
                  summary[d][m]["status"] = "COMPLETED"
@@ -1778,7 +1972,10 @@ def index():
     total_earnings = 0
     total_mission_seconds = 0
     
-    for f in data_store["finished_missions"]:
+    # Use persistent history for totals
+    history_source = data_store.get("finished_fixed", [])
+    
+    for f in history_source:
         # Only count actual completed missions (not cancelled/failed)
         # Default to COMPLETED for backward compatibility
         if f.get("status", "COMPLETED") == "COMPLETED":
@@ -1881,7 +2078,7 @@ def index():
                 tag_class_extra = " COMPLETED" if is_completed else ""
                 
                 # Material Name Style (Strikethrough if fully done)
-                mat_style = "text-decoration: line-through; opacity: 0.6;" if is_completed else ""
+                mat_style = "text-decoration: line-through; opacity: 0.5; color: #888;" if is_completed else ""
                 
                 if p_vol > 0:
                     p_current = data["delivered_pickup"]
@@ -1915,7 +2112,7 @@ def index():
                     
                     if rep_mid and rep_key:
                          badges += f"""
-                         <span class='scu-box pickup-tag{p_style_class}' style='cursor:pointer;' onclick="toggleItemEdit('{rep_mid}_{rep_key}')" title="{T('click_to_edit', 'ui', 'Click to edit quantity')}">
+                         <span class='scu-box pickup-tag{p_style_class}' style='cursor:pointer; {mat_style}' onclick="toggleItemEdit('{rep_mid}_{rep_key}')" title="{T('click_to_edit', 'ui', 'Click to edit quantity')}">
                               {prefix}{T('pickup')}: {vol_display}
                          </span>
                          <div id="item_edit_{rep_mid}_{rep_key}" style="display:none; position:absolute; background:#111; border:1px solid #444; padding:5px; z-index:100;">
@@ -1934,7 +2131,7 @@ def index():
                          </div>
                          """
                     else:
-                         badges += f"<span class='scu-box pickup-tag{p_style_class}'>{prefix}{T('pickup')}: {vol_display}</span>"
+                         badges += f"<span class='scu-box pickup-tag{p_style_class}' style='{mat_style}'>{prefix}{T('pickup')}: {vol_display}</span>"
                     
                 if d_vol > 0:
                     d_current = data["delivered_delivery"]
@@ -1965,7 +2162,7 @@ def index():
                     
                     if rep_mid and rep_key:
                          badges += f"""
-                         <span class='scu-box deliver-tag{d_style_class}' style='cursor:pointer;' onclick="toggleItemEdit('{rep_mid}_{rep_key}')" title="{T('click_to_edit', 'ui', 'Click to edit quantity')}">
+                         <span class='scu-box deliver-tag{d_style_class}' style='cursor:pointer; {mat_style}' onclick="toggleItemEdit('{rep_mid}_{rep_key}')" title="{T('click_to_edit', 'ui', 'Click to edit quantity')}">
                               {prefix}{label}: {vol_display} <small>✏️</small>
                          </span>
                          <div id="item_edit_{rep_mid}_{rep_key}" style="display:none; position:absolute; background:#111; border:1px solid #444; padding:5px; z-index:100;">
@@ -1988,13 +2185,47 @@ def index():
                          </div>
                          """
                     else:
-                         badges += f"<span class='scu-box deliver-tag{d_style_class}'>{prefix}{label}: {vol_display}</span>"
+                         badges += f"<span class='scu-box deliver-tag{d_style_class}' style='{mat_style}'>{prefix}{label}: {vol_display}</span>"
                 
                 if p_vol == 0 and d_vol == 0:
                     badges += f"<span class='scu-box' style='color:#ffcc00; border:1px solid #ffcc0044;'>⏳ {T('waiting_cargo')}</span>"
 
+                # Calculate Container Breakdown (for total volume)
+                # We prioritize delivery volume if present, otherwise pickup volume
+                target_vol = d_vol if d_vol > 0 else p_vol
+                container_html = ""
+                
+                # Retrieve max_size from aggregated data
+                max_size_pref = data.get("max_size", 32)
+                
+                if target_vol > 0:
+                     c_breakdown = get_container_breakdown(target_vol, max_size_pref)
+                     c_style = "opacity:0.3; filter:grayscale(100%); text-decoration:line-through;" if is_completed else "opacity:0.8;"
+                     
+                     # Container Size Selector (Dropdown)
+                     # We use the first mission ID found in the aggregation for the update action
+                     first_mid = next(iter(data["mission_ids"])) if data.get("mission_ids") else ""
+                     
+                     size_selector = ""
+                     if first_mid:
+                         size_options = ""
+                         for s in [32, 16, 8, 4]:
+                             sel = "selected" if s == max_size_pref else ""
+                             size_options += f"<option value='{s}' {sel}>{s}</option>"
+                         
+                         size_selector = f"""
+                         <form action="/update_container_size" method="post" style="display:inline-block; margin-left:5px;">
+                            <input type="hidden" name="mission_id" value="{first_mid}">
+                            <select name="max_size" onchange="this.form.submit()" style="background:#222; color:#888; border:1px solid #444; font-size:0.7rem; padding:0; border-radius:3px; cursor:pointer;" title="{T('max_container_size', 'ui', 'Max Container Size')}">
+                                {size_options}
+                            </select>
+                         </form>
+                         """
+
+                     container_html = f"<div style='display:inline-flex; align-items:center; margin-left:10px; {c_style}'>{c_breakdown}{size_selector}</div>"
+
                 html += f"<div style='display:flex; justify-content:space-between; align-items:center; margin:8px 0; padding:5px 0; border-bottom:1px solid #21262d33;'>"
-                html += f"<span style='{mat_style}'>▪ {m}</span><div style='display:flex; align-items:center; gap:10px;'>{badges}"
+                html += f"<span style='{mat_style}'>▪ {m} {container_html}</span><div style='display:flex; align-items:center; gap:10px;'>{badges}"
                 
                 # Render buttons for each linked mission
                 if "mission_ids" in data:
@@ -2018,6 +2249,7 @@ def index():
                                     <div style="display:flex; gap:5px; margin-bottom:5px;">
                                         <input type="text" name="material" placeholder="{T('material')}" style="width:100px; background:#222; border:1px solid #444; color:#fff; padding:3px; border-radius:3px;" required>
                                         <input type="number" name="quantity" placeholder="{T('quantity')}" style="width:50px; background:#222; border:1px solid #444; color:#fff; padding:3px; border-radius:3px;" required>
+                                        <input type="text" name="origin" placeholder="{T('origin_ph', 'ui', 'Origin (Opt)')}" style="width:100px; background:#222; border:1px solid #444; color:#fff; padding:3px; border-radius:3px;">
                                         <input type="text" name="destination" placeholder="{T('destination_ph')}" style="width:100px; background:#222; border:1px solid #444; color:#fff; padding:3px; border-radius:3px;" required>
                                     </div>
                                 </div>
@@ -2103,6 +2335,7 @@ def index():
             div.innerHTML = `
                 <input type="text" name="material" placeholder="{T('material')}" style="width:120px; background:#222; border:1px solid #444; color:#fff; padding:5px; border-radius:3px;" onfocus="setPaused()" required>
                 <input type="number" name="quantity" placeholder="{T('quantity')}" style="width:60px; background:#222; border:1px solid #444; color:#fff; padding:5px; border-radius:3px;" onfocus="setPaused()" required>
+                <input type="text" name="origin" placeholder="{T('origin_ph', 'ui', 'Origin (Opt)')}" style="width:100px; background:#222; border:1px solid #444; color:#fff; padding:5px; border-radius:3px;" onfocus="setPaused()">
                 <input type="text" name="destination" placeholder="{T('destination_ph')}" style="width:120px; background:#222; border:1px solid #444; color:#fff; padding:5px; border-radius:3px;" onfocus="setPaused()" required>
                 <button type="button" onclick="this.parentElement.remove()" style="background:#442222; color:#ff5555; border:none; padding:0 8px; cursor:pointer;">x</button>
             `;
@@ -2136,8 +2369,8 @@ def index():
     # REMOVED: Moved to separate app (Hauling_web_Hangar.py)
     
     html += f"<div class='footer' id='footer-content'><b>📋 {T('mission_history')}:</b><hr style='border-color:#21262d; margin:10px 0;'>"
-    if data_store["finished_missions"]:
-        for i, f in enumerate(data_store["finished_missions"][:10]):
+    if data_store.get("finished_fixed"):
+        for i, f in enumerate(data_store["finished_fixed"][:10]):
             mission_short = f['id'][:8] if len(f['id']) > 8 else f['id']
             title = f.get('title', f"{T('mission')} {mission_short}")
             value = f.get('value', 0)
@@ -2177,8 +2410,12 @@ def index():
                 f"<div style='display:flex; justify-content:space-between; width:100%; margin-bottom:4px;'>"
                 f"  <span style='font-weight:bold; color:{title_color}; font-size:0.95rem;'>{title}</span>"
                 f"  <div style='display:flex; align-items:center; gap:10px;'>"
-                f"      <span style='color:{status_color}; font-family:monospace;'>{value_str}</span>"
-                f"      <a href='/delete_history/{i}' onclick=\"return confirm('{T('delete_confirm')}')\" style='text-decoration:none; color:#666; font-size:0.8rem;' title='{T('delete')}'>❌</a>"
+                f"      <form action='/finish_update' method='post' style='display:inline-flex; align-items:center; gap:5px;'>"
+                f"        <input type='hidden' name='id' value='{f.get('id','')}'>"
+                f"        <input type='number' name='value' value='{value}' style='width:90px; background:#111; color:#ffd700; border:1px solid #333; padding:2px;'>"
+                f"        <button type='submit' style='background:#00f2ff; color:#000; border:none; padding:2px 6px; border-radius:3px; cursor:pointer;'>💾</button>"
+                f"      </form>"
+                f"      <a href='/finish_delete/{f.get('id','')}' onclick=\"return confirm('{T('delete_confirm')}')\" style='text-decoration:none; color:#666; font-size:0.8rem;' title='{T('delete')}'>❌</a>"
                 f"  </div>"
                 f"</div>"
                 f"<div style='display:flex; justify-content:space-between; width:100%; font-size:0.85rem; color:#8b949e;'>"
@@ -2314,6 +2551,7 @@ if __name__ == '__main__':
     
     # Load persisted state (history, active missions)
     load_state()
+    data_store["finished_fixed"] = load_finishes()
     
     print("=" * 60)
     print("🚀 STAR CITIZEN HAULING MONITOR - HYBRID MODE")
@@ -2365,6 +2603,14 @@ if __name__ == '__main__':
                     user32.ShowWindow(hwnd, 5) # SW_SHOW
                     user32.SetForegroundWindow(hwnd)
 
+        def on_restart(icon, item):
+            icon.stop()
+            print("♻️ Reiniciando serviço...")
+            if getattr(sys, 'frozen', False):
+                os.execl(sys.executable, sys.executable, *sys.argv[1:])
+            else:
+                os.execl(sys.executable, sys.executable, *sys.argv)
+
         def on_exit(icon, item):
             icon.stop()
             os._exit(0)
@@ -2374,10 +2620,18 @@ if __name__ == '__main__':
         menu = pystray.Menu(
             pystray.MenuItem("🖥️ Terminal", on_toggle_terminal),
             pystray.MenuItem(T('open_dashboard', 'ui', 'Open Dashboard'), on_open, default=True),
+            pystray.MenuItem("♻️ Reiniciar", on_restart),
             pystray.MenuItem(T('exit', 'ui', 'Exit'), on_exit)
         )
         
         icon = pystray.Icon("HaulingMonitor", image, "Hauling Monitor", menu)
+        
+        # Signal Handler for Ctrl+C
+        def handle_sigint(sig, frame):
+            print("\n🛑 Interrupção recebida (Ctrl+C). Parando...")
+            icon.stop()
+            os._exit(0)
+        signal.signal(signal.SIGINT, handle_sigint)
         
         # Start Flask in a Daemon Thread so it dies when main thread (Icon) dies
         flask_thread = threading.Thread(target=run_flask, daemon=True)

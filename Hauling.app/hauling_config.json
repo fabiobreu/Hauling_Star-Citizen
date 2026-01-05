@@ -1,7 +1,7 @@
 {
   "web_port": 5000,
   "refresh_interval_ms": 2000,
-  "language": "en",
+  "language": "pt",
   "log_path": "C:\\Program Files\\Roberts Space Industries\\StarCitizen\\LIVE\\Game.log",
   "patterns": {
     "contract_accepted_regex": "Contract Accepted:\\s*(.+?)(?::|\\\"|\\[|$)",
