@@ -579,11 +579,7 @@ class HaulingMonitor:
                         self.archive_stale_mission(title)
                     elif mission_id and mission_id in data_store["missions"]:
                         print(f"🛑 Mission Ended (ID Match): {mission_id}")
-                        data_store["missions"][mission_id]["status"] = "CANCELLED"
-                        if "time" not in data_store["missions"][mission_id]:
-                             data_store["missions"][mission_id]["time"] = time.strftime("%H:%M:%S")
-                        data_store["finished_missions"].insert(0, data_store["missions"][mission_id])
-                        del data_store["missions"][mission_id]
+                        self.archive_specific_mission(mission_id)
                     save_state()
 
                 # 1.6 Contract Complete (Specific Handling for Salvage/Special Missions)
@@ -1947,6 +1943,7 @@ def index():
                     "delivered_delivery": 0,
                     "mission_ids": set(),
                     "all_items_completed": True,
+                    "all_pickups_completed": True,
                     "max_size": max_size # Store preference
                 }
             
@@ -1957,6 +1954,10 @@ def index():
             # Only DELIVERY items must be completed.
             if i_type != "PICKUP" and status != "COMPLETED":
                 summary[d][m]["all_items_completed"] = False
+            
+            # Track pickup completion separately for Pickup-Only groups
+            if i_type == "PICKUP" and status != "COMPLETED":
+                summary[d][m]["all_pickups_completed"] = False
 
             # Sum up volumes based on type
             if i_type == "PICKUP":
@@ -1967,12 +1968,20 @@ def index():
                 summary[d][m]["delivered_delivery"] += delivered
             
             # Status check:
-            # 1. If explicitly all items (excluding pickups) are COMPLETED, then COMPLETED.
-            # 2. OR if delivery count is satisfied (fallback)
-            if summary[d][m]["all_items_completed"]:
-                 summary[d][m]["status"] = "COMPLETED"
-            elif summary[d][m]["deliver_vol"] > 0 and summary[d][m]["delivered_delivery"] >= summary[d][m]["deliver_vol"]:
-                 summary[d][m]["status"] = "COMPLETED"
+            # 1. If it has deliveries (Destination), status depends on DELIVERY completion.
+            # 2. If it has NO deliveries (Origin), status depends on PICKUP completion.
+            
+            if summary[d][m]["deliver_vol"] > 0:
+                 if summary[d][m]["all_items_completed"]:
+                     summary[d][m]["status"] = "COMPLETED"
+                 elif summary[d][m]["delivered_delivery"] >= summary[d][m]["deliver_vol"]:
+                     summary[d][m]["status"] = "COMPLETED"
+            else:
+                 # Pickup Only Group (Origin)
+                 if summary[d][m]["all_pickups_completed"]:
+                      summary[d][m]["status"] = "COMPLETED"
+                 elif summary[d][m]["pickup_vol"] > 0 and summary[d][m]["delivered_pickup"] >= summary[d][m]["pickup_vol"]:
+                      summary[d][m]["status"] = "COMPLETED"
 
     mission_icons = {
         "READY": "⚪", "ACTIVE": "🟡", "COMPLETED": "✅", "CANCELLED": "🔴"
@@ -2315,6 +2324,7 @@ def index():
                     <div style="display:flex; gap:5px; margin-bottom:5px;">
                         <input type="text" name="material" placeholder="{T('material')}" style="width:120px; background:#222; border:1px solid #444; color:#fff; padding:5px; border-radius:3px;" required>
                         <input type="number" name="quantity" placeholder="{T('quantity')}" style="width:60px; background:#222; border:1px solid #444; color:#fff; padding:5px; border-radius:3px;" required>
+                        <input type="text" name="origin" placeholder="{T('origin_ph', 'ui', 'Origin (Opt)')}" style="width:100px; background:#222; border:1px solid #444; color:#fff; padding:5px; border-radius:3px;">
                         <input type="text" name="destination" placeholder="{T('destination_ph')}" style="width:120px; background:#222; border:1px solid #444; color:#fff; padding:5px; border-radius:3px;" required>
                     </div>
                 </div>
