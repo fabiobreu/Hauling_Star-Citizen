@@ -4,6 +4,9 @@ Hauling mission monitoring tool for Star Citizen. This application reads the gam
 
 *Note: Reading the Log presents significant challenges as it is not a formal API that provides structured information. This can cause failures or missing information regarding cargo delivery, especially if log formats change with game version updates. Additionally, since the universe mapping is extensive and requires refinement, we have focused testing on specific sectors, which may result in missing data for other areas. Expanding this mapping is a key area for future improvement.*
 
+<img width="1085" height="949" alt="image" src="https://github.com/user-attachments/assets/fafe5281-2fa9-46ba-8d94-c7d9fd0be094" />
+
+
 ## 🚀 Features
 
 -   **Automatic Tracking**: Detects accepted Hauling missions, cargo pickup, and deliveries directly from the game log.
