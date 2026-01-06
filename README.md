@@ -11,10 +11,11 @@ Hauling mission monitoring tool for Star Citizen. This application reads the gam
 
 -   **Automatic Tracking**: Detects accepted Hauling missions, cargo pickup, and deliveries directly from the game log.
 -   **Web Dashboard**: Modern and responsive visual interface (Dark Mode) to track your missions on a second monitor, tablet, or phone.
+-   **Smart Logic**: Distinguishes between Pickup (Origin) and Delivery (Destination) locations for accurate status tracking.
 -   **Multi-Language**: Full support for Portuguese (PT) and English (EN), configurable via JSON file.
--   **Manual Editing**: Allows manual addition of items if the log fails to capture an event or for older missions.
+-   **Manual Editing**: Allows manual addition of items (including Origin/Pickup) if the log fails to capture an event.
 -   **Mission History**: Saves completed, abandoned, or failed missions, with calculations for total earnings and mission time.
--   **Persistence**: Current state is automatically saved (`hauling_state.json`), allowing you to close and reopen the tool without losing progress.
+-   **Persistence**: Current state is automatically saved (`hauling_state.json`), allowing you to close and reopen the tool without losing progress. Robust error handling ensures automatic recovery from corrupted files.
 -   **Identification**: Automatically detects the player name and ship used.
 
 ## 🛠️ Installation and Execution
@@ -23,7 +24,7 @@ Hauling mission monitoring tool for Star Citizen. This application reads the gam
 -   Python 3.8 or higher installed.
 -   Required Python libraries (install via pip):
     ```bash
-    pip install flask
+    pip install flask pillow pystray
     ```
 
 ### How to Run
@@ -35,6 +36,9 @@ Hauling mission monitoring tool for Star Citizen. This application reads the gam
     ```
 4.  Open your browser at the indicated address (usually `http://0.0.0.0:5000` or `http://localhost:5000`).
 
+**Note for Executable Users:**
+If running the compiled `HaulingMonitor.exe`, a console window will appear alongside the application. This is intentional to display logs and status messages for easier troubleshooting.
+
 ## ⚙️ Configuration (`hauling_config.json`)
 
 The `hauling_config.json` file controls the tool's behavior. The main options are:
@@ -42,8 +46,21 @@ The `hauling_config.json` file controls the tool's behavior. The main options ar
 *   `"log_path"`: Absolute path to the Star Citizen `Game.log` file.
     *   Example: `"C:/Program Files/Roberts Space Industries/StarCitizen/LIVE/Game.log"`
 *   `"language"`: Defines the interface language (`"pt"` for Portuguese, `"en"` for English).
+*   `"log_language"`: Defines the game log language for parsing (`"en"`, `"pt"`, etc). Should match the language you play the game in.
+    *   Example: `"en"` loads `patterns_en.json`, `"pt"` loads `patterns_pt.json`.
 *   `"web_port"`: Port for the web server (default: `5000`).
 *   `"refresh_interval_ms"`: Page refresh interval in milliseconds (default: `2000`).
+
+## 🛠️ Customizing Log Parsing (Regex)
+
+If the game updates or you play in a different language, you can modify how the tool reads the logs without touching the code or recompiling.
+
+1.  Open the `patterns_{LANG}.json` file corresponding to your `log_language` (e.g., `patterns_en.json` or `patterns_pt.json`).
+2.  Edit the values to match the text in your `Game.log`.
+    *   `contract_accepted`: The phrase that indicates a new contract.
+    *   `scu_regex`: The regular expression to extract SCU amount, material, and locations.
+    *   `reward_regex`: The regular expression to extract mission rewards (aUEC).
+3.  Restart the application to apply changes.
 
 ## 🌍 Translation and Internationalization
 
@@ -78,6 +95,8 @@ Contributions are welcome! If you want to improve the code, add features, or fix
 *   `hauling_config.json`: Configuration file.
 *   `hauling_lang_pt.json`: PT-BR translation file.
 *   `hauling_lang_en.json`: EN translation file.
+*   `patterns_en.json`: Regex patterns for English logs.
+*   `patterns_pt.json`: Regex patterns for Portuguese logs.
 *   `hauling_state.json`: Automatically generated file to save progress (should not be committed).
 
 ---

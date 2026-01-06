@@ -1,0 +1,15 @@
+{
+  "contract_accepted": "Contrato Aceito",
+  "contract_accepted_regex": "Contrato Aceito:\\s*(.+?)(?::|\\\"|\\[|$)",
+  "contract_canceled": "Contrato Cancelado",
+  "contract_abandoned": "Contrato Abandonado",
+  "contract_failed": "Contrato Falhou",
+  "new_objective": "Novo Objetivo",
+  "objective_complete": "Objetivo Concluído",
+  "contract_complete": "Contrato Concluído",
+  "contract_complete_regex": "Contrato Concluído:\\s*(.+?)(?::|\\\"|\\[|$)",
+  "contract_ended_regex": "Contrato (?:Cancelado|Abandonado|Falhou):\\s*(.+?)(?::|\\\"|\\[|$)",
+  "reward_regex": "Recebido\\s+(\\d+)\\s+aUEC",
+  "scu_regex": "(Entregar|Coletar|Pegar|Transportar|Deixar)\\s+(\\d+)(?:[/\\s]+(\\d+))?\\s+SCU\\s+(?:de|of)?\\s*([A-Za-z0-9\\s\\(\\)\\-\\.]+?)\\s+(?:para|em|de|to|at)\\s+([A-Za-z0-9\\s\\(\\)\\-\\.]+?)(?::|\\\"|\\[|<)",
+  "generic_regex": "(Entregar|Coletar|Pegar)\\s+(.+?)\\s+(?:para|em|de|to|at)\\s+([A-Za-z0-9\\s\\-\\.]+?)(?::|\\\"|\\[|$)"
+}

@@ -1,5 +1,5 @@
-import os, time, re, threading, json, sys, webbrowser, signal
-from flask import Flask, render_template_string, request, jsonify
+import os, time, re, threading, json, sys, webbrowser, signal, hashlib
+from flask import Flask, render_template_string, request, jsonify, make_response
 from datetime import datetime, timedelta, timezone
 try:
     import pystray
@@ -15,6 +15,7 @@ WEB_PORT = 5000
 WEB_HOST = '0.0.0.0'
 REFRESH_INTERVAL_MS = 2000
 LANGUAGE = "en"
+LOG_LANGUAGE = "en" # Default log language
 
 # --- DEFAULT PATTERNS (Fallback) ---
 PATTERNS = {
@@ -25,9 +26,16 @@ PATTERNS = {
     "notif_text_regex": r'Added notification "(.*?)"',
     "contract_accepted": "Contract Accepted",
     "contract_accepted_regex": r'Contract Accepted:\s*(.+?)(?::|\"|\[|$)',
+    "contract_canceled": "Contract Canceled",
+    "contract_abandoned": "Contract Abandoned",
+    "contract_failed": "Contract Failed",
     "new_objective": "New Objective",
     "objective_complete": "Objective Complete",
-    "scu_regex": r"(Deliver|Pickup|Dropoff|Transport|Collect)\s+(\d+)(?:[/\s]+(\d+))?\s+SCU\s+(?:of|de)?\s*([A-Za-z0-9\s\(\)\-\.]+?)\s+(?:to|at|for|towards|para|em|de)\s+([A-Za-z0-9\s\(\)\-\.]+?)(?::|\"|\[|$)",
+    "contract_complete": "Contract Complete",
+    "contract_complete_regex": r'Contract Complete:\s*(.+?)(?::|\"|\[|$)',
+    "contract_ended_regex": r'Contract (?:Canceled|Abandoned|Failed):\s*(.+?)(?::|\"|\[|$)',
+    "reward_regex": r"Awarded\s+(\d+)\s+aUEC",
+    "scu_regex": r"(Deliver|Pickup|Dropoff|Transport|Collect)\s+(\d+)(?:[/\s]+(\d+))?\s+SCU\s+(?:of|de)?\s*([A-Za-z0-9\s\(\)\-\.]+?)\s+(?:to|at|for|towards|para|em|de)\s+([A-Za-z0-9\s\(\)\-\.]+?)(?::|\"|\[|<)",
     "generic_regex": r"(Deliver|Pickup|Collect)\s+(.+?)\s+(?:to|at|from|para|de)\s+([A-Za-z0-9\s\-\.]+?)(?::|\"|\[|$)",
     "marker_event": "<CLocalMissionPhaseMarker::CreateMarker>",
     "marker_contract_tag": "contract [",
@@ -145,7 +153,37 @@ def load_finishes():
     try:
         if os.path.exists(FINISH_FILE):
             with open(FINISH_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                items = json.load(f)
+                
+                # DEDUPLICATION LOGIC
+                seen_ids = set()
+                seen_rewards = set() # (value, time) tuple
+                unique_items = []
+                
+                for item in items:
+                    # 1. ID Check
+                    if item.get('id') in seen_ids:
+                        continue
+                        
+                    # 2. Reward Content Check (Handle legacy non-deterministic IDs)
+                    if item.get('source') == "LOG (Reward)":
+                        # Key: Value + Time (approximate check not needed if we assume exact time string match from same log run)
+                        # We use time string (HH:MM:SS) which is granular enough to likely catch duplicates from same log event
+                        key = (item.get('value'), item.get('time'))
+                        if key in seen_rewards:
+                            continue
+                        seen_rewards.add(key)
+                        
+                    seen_ids.add(item.get('id'))
+                    unique_items.append(item)
+                
+                # If we filtered anything, save back immediately
+                if len(unique_items) < len(items):
+                    diff = len(items) - len(unique_items)
+                    print(f"🧹 {T('dedup_log', 'log', 'Deduplicated History')}: {diff} {T('entries_removed', 'log', 'entries removed')}")
+                    save_finishes(unique_items)
+                    
+                return unique_items
     except Exception as e:
         print(f"⚠ Failed to load finish file: {e}")
     return []
@@ -255,7 +293,10 @@ data_store = {
     "next_destination": "None",
     "fuel_estimate": 0,
     "mission_status": "READY",
-    "session_start": datetime.now()
+    "session_start": datetime.now(),
+    "notif_mission_map": {},
+    "last_completed_mission_id": None,
+    "last_completed_ts": None
 }
 
 def clean_location_name(raw_name):
@@ -352,7 +393,7 @@ def clean_location_name(raw_name):
 
 def load_saved_config():
     """Load saved config (if any) from disk and merge into globals."""
-    global LOG_PATH, WEB_PORT, WEB_HOST, REFRESH_INTERVAL_MS, PATTERNS, LANGUAGE
+    global LOG_PATH, WEB_PORT, WEB_HOST, REFRESH_INTERVAL_MS, PATTERNS, LANGUAGE, LOG_LANGUAGE
     try:
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, 'r', encoding='utf-8') as fh:
@@ -362,11 +403,23 @@ def load_saved_config():
                 if 'web_host' in cfg: WEB_HOST = cfg.get('web_host', '0.0.0.0')
                 if 'refresh_interval_ms' in cfg: REFRESH_INTERVAL_MS = int(cfg.get('refresh_interval_ms', 2000))
                 if 'language' in cfg: LANGUAGE = cfg.get('language', 'en')
+                if 'log_language' in cfg: LOG_LANGUAGE = cfg.get('log_language', 'en')
+
+                # Load external patterns based on log_language
+                pattern_file = os.path.join(BASE_DIR, f"patterns_{LOG_LANGUAGE}.json")
+                if os.path.exists(pattern_file):
+                    try:
+                        with open(pattern_file, 'r', encoding='utf-8') as pf:
+                            custom_patterns = json.load(pf)
+                            PATTERNS.update(custom_patterns)
+                            print(f"✓ Loaded patterns from {pattern_file}")
+                    except Exception as e:
+                        print(f"⚠ Failed to load pattern file {pattern_file}: {e}")
                 
-                # Merge Patterns
+                # Merge Patterns (Legacy support)
                 if 'patterns' in cfg:
                     PATTERNS.update(cfg['patterns'])
-                    print("✓ Loaded custom patterns from config")
+                    print("✓ Loaded custom patterns from config (Legacy)")
                     
                 return True
     except Exception as e:
@@ -571,7 +624,7 @@ class HaulingMonitor:
                 # 1.5 Contract Canceled / Abandoned / Failed
                 elif any(p in notification_text for p in [PATTERNS.get("contract_canceled", "Contract Canceled"), PATTERNS.get("contract_abandoned", "Contract Abandoned"), PATTERNS.get("contract_failed", "Contract Failed")]):
                     # Extract title
-                    title_match = re.search(r'Contract (?:Canceled|Abandoned|Failed):\s*(.+?)(?::|\"|\[|$)', notification_text)
+                    title_match = re.search(PATTERNS["contract_ended_regex"], notification_text)
                     title = title_match.group(1).strip() if title_match else None
                     
                     if title:
@@ -583,8 +636,8 @@ class HaulingMonitor:
                     save_state()
 
                 # 1.6 Contract Complete (Specific Handling for Salvage/Special Missions)
-                elif "Contract Complete" in notification_text:
-                    title_match = re.search(r'Contract Complete:\s*(.+?)(?::|\"|\[|$)', notification_text)
+                elif PATTERNS["contract_complete"] in notification_text:
+                    title_match = re.search(PATTERNS["contract_complete_regex"], notification_text)
                     title = title_match.group(1).strip() if title_match else "Unknown Contract"
                     
                     # SALVAGE MISSION DETECTION
@@ -817,6 +870,25 @@ class HaulingMonitor:
                 if count_match:
                     count = count_match.group(1)
                     print(f"🏗️ LOG (Native): Cargo Elevator detected {count} items on grid.")
+                    try:
+                        cnt = int(count)
+                    except:
+                        cnt = -1
+                    if cnt == 0:
+                        cur_loc = data_store.get("current_location", "")
+                        def is_loc_match(loc1, loc2):
+                            l1, l2 = loc1.lower(), loc2.lower()
+                            return l1 == l2 or l1 in l2 or l2 in l1
+                        changed = False
+                        for m_id, m_data in list(data_store["missions"].items()):
+                            for k, v in m_data.get("items", {}).items():
+                                if v.get("type") != "PICKUP" and v.get("status") != "COMPLETED":
+                                    if cur_loc and is_loc_match(v.get("dest",""), cur_loc):
+                                        v["delivered"] = v.get("vol", 0)
+                                        v["status"] = "COMPLETED"
+                                        changed = True
+                        if changed:
+                            save_state()
 
 
         # --- NOTIFICATION BASED PARSING (UI Logs - Fallback) ---
@@ -832,8 +904,8 @@ class HaulingMonitor:
                 self.processed_notification_ids.add(notif_id)
             
             # A. Contract Accepted (Notification)
-            if "Contract Accepted" in line:
-                title_match = re.search(r'Contract Accepted:\s*(.+?)(?::|\"|\[)', line)
+            if PATTERNS["contract_accepted"] in line:
+                title_match = re.search(PATTERNS["contract_accepted_regex"], line)
                 title = title_match.group(1).strip() if title_match else "Unknown Contract"
                 
                 # Generate a deterministic ID based on Notification ID (to allow persistence/deletion)
@@ -859,10 +931,10 @@ class HaulingMonitor:
                     save_state()
             
             # B. New Objective (Notification)
-            elif "New Objective" in line or "Objective Complete" in line:
+            elif PATTERNS["new_objective"] in line or PATTERNS["objective_complete"] in line:
                 # Regex for cargo details (English)
                 obj_match = re.search(
-                    r"(Deliver|Pickup|Dropoff|Transport|Collect)\s+(\d+)[/\s]+(\d+)\s+SCU\s+(?:of|de)?\s*([A-Za-z0-9\s\(\)\-\.]+?)\s+(?:to|at|for|towards|para|em|de)\s+([A-Za-z0-9\s\(\)\-\.]+?)(?::|\"|\[)", 
+                    PATTERNS["scu_regex"], 
                     line, re.IGNORECASE
                 )
                 
@@ -888,12 +960,20 @@ class HaulingMonitor:
                         }
 
                     action = obj_match.group(1).upper()
-                    current = int(obj_match.group(2))
-                    total = int(obj_match.group(3))
+                    val1 = int(obj_match.group(2))
+                    val2 = obj_match.group(3)
+                    
+                    if val2:
+                        current = val1
+                        total = int(val2)
+                    else:
+                        current = 0 
+                        total = val1
+
                     material = obj_match.group(4).strip().upper()
                     location = clean_location_name(obj_match.group(5))
                     
-                    is_pickup = action in ['COLLECT', 'PICKUP', 'RETRIEVE', 'COLETAR', 'PEGAR']
+                    is_pickup = action in ['COLLECT', 'PICKUP', 'RETRIEVE', 'COLETAR', 'PEGAR', 'ENTREGAR', 'DEIXAR', 'TRANSPORTAR']
                     type_str = "PICKUP" if is_pickup else "DELIVERY"
                     
                     item_key = f"{material}_{location}_{type_str}"
@@ -909,7 +989,7 @@ class HaulingMonitor:
                             del data_store["missions"][m_id]["items"][k]
                             print(f"♻️ {T('log_replaced', 'log')}: {material} -> {location}")
                     
-                    is_complete_event = "Objective Complete" in line
+                    is_complete_event = PATTERNS["objective_complete"] in line
                     
                     # Logic: If it is "Objective Complete", FORCE status=COMPLETED
                     status_val = "COMPLETED" if (is_complete_event or (current >= total and total > 0)) else "PENDING"
@@ -963,9 +1043,9 @@ class HaulingMonitor:
 
         # 3. MISSION START (Contract Accepted)
         # <SHUDEvent_OnNotification> Added notification "Contract Accepted: Title..." ... MissionId: [ID]
-        if "Contract Accepted" in line and "MissionId" in line:
-            id_match = re.search(r"MissionId:\s*\[([a-f0-9\-]+)\]", line)
-            title_match = re.search(r"Contract Accepted:\s*(.+?)(?::|\"|\[)", line)
+        if PATTERNS["contract_accepted"] in line and PATTERNS["mission_id_tag"] in line:
+            id_match = re.search(PATTERNS["mission_id_regex"], line)
+            title_match = re.search(PATTERNS["contract_accepted_regex"], line)
             
             if id_match:
                 m_id = id_match.group(1)
@@ -991,13 +1071,13 @@ class HaulingMonitor:
 
         # 4. MISSION OBJECTIVE (Cargo Details)
         # "New Objective: Deliver 0/9 SCU of Silicon to HDPC-Farnesway: " ... MissionId: [ID]
-        if ("New Objective:" in line or "Objective Complete:" in line) and "MissionId" in line:
-            id_match = re.search(r"MissionId:\s*\[([a-f0-9\-]+)\]", line)
+        if (PATTERNS["new_objective"] in line or PATTERNS["objective_complete"] in line) and PATTERNS["mission_id_tag"] in line:
+            id_match = re.search(PATTERNS["mission_id_regex"], line)
             
             # Regex for cargo details (English)
             # Added '<' to terminator list to handle timestamped logs like "...Workcenter <2025..."
             obj_match = re.search(
-                r"(Deliver|Pickup|Dropoff|Transport|Collect)\s+(\d+)[/\s]+(\d+)\s+SCU\s+(?:of|de)?\s*([A-Za-z0-9\s\(\)\-\.]+?)\s+(?:to|at|for|towards|para|em|de)\s+([A-Za-z0-9\s\(\)\-\.]+?)(?::|\"|\[|<)", 
+                PATTERNS["scu_regex"], 
                 line, re.IGNORECASE
             )
             
@@ -1009,12 +1089,20 @@ class HaulingMonitor:
                     return False
 
                 action = obj_match.group(1).upper()
-                current = int(obj_match.group(2))
-                total = int(obj_match.group(3))
+                val1 = int(obj_match.group(2))
+                val2 = obj_match.group(3)
+                
+                if val2:
+                    current = val1
+                    total = int(val2)
+                else:
+                    current = 0 
+                    total = val1
+
                 material = obj_match.group(4).strip().upper()
                 location = clean_location_name(obj_match.group(5))
                 
-                is_pickup = action in ['COLLECT', 'PICKUP', 'RETRIEVE']
+                is_pickup = action in ['COLLECT', 'PICKUP', 'RETRIEVE', 'COLETAR', 'PEGAR', 'ENTREGAR', 'DEIXAR', 'TRANSPORTAR']
                 type_str = "PICKUP" if is_pickup else "DELIVERY"
 
                 # Ensure mission exists (handle out-of-order logs)
@@ -1043,7 +1131,7 @@ class HaulingMonitor:
                         print(f"♻️ LOG Replaced Manual Item: {material} -> {location}")
 
                 # Check explicit completion event
-                is_complete_event = "Objective Complete" in line
+                is_complete_event = PATTERNS["objective_complete"] in line
                 
                 # Logic: If it is "Objective Complete", FORCE status=COMPLETED
                 status_val = "COMPLETED" if (is_complete_event or (current >= total and total > 0)) else "PENDING"
@@ -1118,6 +1206,8 @@ class HaulingMonitor:
                             data_store["processed_mission_ids"].append(m_id)
                             
                         save_state()
+                        data_store["last_completed_mission_id"] = m_id
+                        data_store["last_completed_ts"] = datetime.now()
                         
                 elif comp_type in ["ABANDON", "FAIL", "ABANDONED", "FAILED"]:
                     # Archive to history as CANCELLED/FAILED
@@ -1150,8 +1240,16 @@ class HaulingMonitor:
 
         # 6. REWARD DETECTION
         # "Awarded 50250 aUEC: " [21]
-        if "Awarded" in line and "aUEC" in line:
-            reward_match = re.search(r"Awarded\s+(\d+)\s+aUEC", line)
+        if PATTERNS["notification_event"] in line:
+            nid_match = re.search(PATTERNS["notif_id_regex"], line)
+            mid_match = re.search(PATTERNS["mission_id_regex"], line)
+            if nid_match and mid_match:
+                nid = nid_match.group(1)
+                mid = mid_match.group(1)
+                data_store["notif_mission_map"][nid] = mid
+        
+        if "aUEC" in line:
+            reward_match = re.search(PATTERNS["reward_regex"], line)
             if reward_match:
                 amount = int(reward_match.group(1))
                 
@@ -1163,6 +1261,34 @@ class HaulingMonitor:
                 
                 if history_source:
                     assigned = False
+                    
+                    if PATTERNS["ui_notif_event"] in line:
+                        ui_match = re.search(PATTERNS["ui_notif_id_regex"], line)
+                        if ui_match:
+                            ui_id = ui_match.group(1)
+                            target_mid = data_store["notif_mission_map"].get(ui_id)
+                            if target_mid:
+                                for i in range(min(20, len(history_source))):
+                                    mission = history_source[i]
+                                    if mission.get("id") == target_mid and not mission.get("value"):
+                                        mission["value"] = amount
+                                        update_finish_value(target_mid, amount)
+                                        print(f"💰 {T('source_log', 'ui')}: {T('reward_detected', 'log')}: {amount} aUEC -> {mission['title']} ({target_mid})")
+                                        assigned = True
+                                        break
+                    
+                    if not assigned and data_store.get("last_completed_mission_id"):
+                        last_id = data_store["last_completed_mission_id"]
+                        last_ts = data_store.get("last_completed_ts")
+                        if last_ts and (datetime.now() - last_ts) <= timedelta(seconds=30):
+                            for i in range(min(20, len(history_source))):
+                                mission = history_source[i]
+                                if mission.get("id") == last_id and not mission.get("value"):
+                                    mission["value"] = amount
+                                    update_finish_value(last_id, amount)
+                                    print(f"💰 {T('source_log', 'ui')}: {T('reward_detected', 'log')}: {amount} aUEC -> {mission['title']} ({last_id})")
+                                    assigned = True
+                                    break
                     # Check the last 10 finished missions
                     for i in range(min(10, len(history_source))):
                         mission = history_source[i]
@@ -1200,8 +1326,13 @@ class HaulingMonitor:
                         else:
                              # Create Orphan Reward Entry
                              print(f"💰 {T('source_log', 'ui')}: {T('reward_detected', 'log')}: {amount} aUEC (Orphan/New)")
+                             
+                             # Deterministic ID based on log line content (prevents duplicates on re-read)
+                             # Use MD5 of the line + amount to ensure uniqueness per event but consistency across restarts
+                             line_hash = hashlib.md5(line.encode('utf-8', 'ignore')).hexdigest()[:10]
+                             
                              orphan_entry = {
-                                "id": f"REWARD_{int(time.time())}",
+                                "id": f"REWARD_{line_hash}",
                                 "title": f"💰 {T('reward', 'ui', 'Reward')} ({amount} aUEC)",
                                 "items": {},
                                 "value": amount,
@@ -1907,14 +2038,35 @@ def hangar_page():
 def update_container_size():
     m_id = request.form.get('mission_id')
     size = request.form.get('max_size')
+    mat = request.form.get('material')
+    dest = request.form.get('destination')
     
-    if m_id and m_id in data_store["missions"]:
-        data_store["missions"][m_id]["max_container_size"] = int(size)
+    try:
+        new_size = int(size)
+    except:
+        return '<meta http-equiv="refresh" content="0;url=/">'
+
+    updated = False
+
+    # 1. Targeted Update: Material + Destination (Cross-Mission)
+    # This fixes the bug where changing one item affected the whole mission
+    if mat and dest:
+        for mid, mission in data_store["missions"].items():
+            for key, item in mission["items"].items():
+                if item.get("mat") == mat and item.get("dest") == dest:
+                    item["max_container_size"] = new_size
+                    updated = True
+                    print(f"🔧 {T('config_update', 'log', 'Config Update')}: {mat} -> {dest} [Max Size: {new_size}]")
+
+    # 2. Fallback: Mission Level (Legacy/Catch-all)
+    if not updated and m_id and m_id in data_store["missions"]:
+        data_store["missions"][m_id]["max_container_size"] = new_size
+        updated = True
+        print(f"🔧 {T('config_update', 'log', 'Config Update')}: Mission {m_id} [Max Size: {new_size}]")
+        
+    if updated:
         save_state()
         
-    # If no specific mission ID (e.g. aggregated view), we might need to update all missions for that material/dest?
-    # For simplicity, the UI will send the "representative" mission ID.
-    
     return '<meta http-equiv="refresh" content="0;url=/">'
 
 @app.route('/')
@@ -1924,12 +2076,15 @@ def index():
     
     for m_id, m_data in data_store["missions"].items():
         # Get max container size for this mission (default 32)
-        max_size = m_data.get("max_container_size", 32)
+        mission_max_size = m_data.get("max_container_size", 32)
         
         for item in m_data["items"].values():
             d, m, v, status = item["dest"], item["mat"], item["vol"], item["status"]
             delivered = item.get("delivered", 0)
             i_type = item.get("type", "DELIVERY") # PICKUP or DELIVERY
+            
+            # Per-Item Preference > Mission Preference
+            item_max_size = item.get("max_container_size", mission_max_size)
             
             if d not in summary:
                 summary[d] = {}
@@ -1944,7 +2099,7 @@ def index():
                     "mission_ids": set(),
                     "all_items_completed": True,
                     "all_pickups_completed": True,
-                    "max_size": max_size # Store preference
+                    "max_size": item_max_size # Store preference
                 }
             
             summary[d][m]["mission_ids"].add(m_id)
@@ -2144,7 +2299,7 @@ def index():
                                    </div>
                                    <div style="display:flex; gap:5px; justify-content:flex-end;">
                                        <button type="submit" style="background:#00f2ff; color:#000; border:none; cursor:pointer; padding:2px 8px; border-radius:3px;">💾 {T('save', 'ui', 'Save')}</button>
-                                       <button type="button" onclick="this.closest('div[id^=item_edit]').style.display='none'" style="background:#333; color:#fff; border:none; cursor:pointer; padding:2px 8px; border-radius:3px;">X</button>
+                                       <button type="button" onclick="closeEdit(this)" style="background:#333; color:#fff; border:none; cursor:pointer; padding:2px 8px; border-radius:3px;">X</button>
                                    </div>
                               </form>
                          </div>
@@ -2198,7 +2353,7 @@ def index():
                                    </div>
                                    <div style="display:flex; gap:5px; justify-content:flex-end;">
                                        <button type="submit" style="background:#00f2ff; color:#000; border:none; cursor:pointer; padding:2px 8px; border-radius:3px;">💾 {T('save', 'ui', 'Save')}</button>
-                                       <button type="button" onclick="this.closest('div[id^=item_edit]').style.display='none'" style="background:#333; color:#fff; border:none; cursor:pointer; padding:2px 8px; border-radius:3px;">X</button>
+                                       <button type="button" onclick="closeEdit(this)" style="background:#333; color:#fff; border:none; cursor:pointer; padding:2px 8px; border-radius:3px;">X</button>
                                    </div>
                               </form>
                          </div>
@@ -2235,6 +2390,8 @@ def index():
                          size_selector = f"""
                          <form action="/update_container_size" method="post" style="display:inline-block; margin-left:5px;">
                             <input type="hidden" name="mission_id" value="{first_mid}">
+                            <input type="hidden" name="material" value="{m}">
+                            <input type="hidden" name="destination" value="{d}">
                             <select name="max_size" onchange="this.form.submit()" style="background:#222; color:#888; border:1px solid #444; font-size:0.7rem; padding:0; border-radius:3px; cursor:pointer;" title="{T('max_container_size', 'ui', 'Max Container Size')}">
                                 {size_options}
                             </select>
@@ -2451,15 +2608,24 @@ def index():
     
     html += """
     <script>
-    var isPaused = false;
     var manualPause = false;
+    var editingPause = false;
+    var typingPause = false;
+    var lastDomUpdateTs = Date.now();
 
     function updatePauseUI() {
         const btn = document.getElementById('pauseBtn');
         if (!btn) return;
-        if (isPaused || manualPause) {
+        
+        if (manualPause) {
             btn.classList.add('paused');
             btn.textContent = '▶ RESUME';
+        } else if (editingPause) {
+             btn.classList.add('paused');
+             btn.textContent = '⏸ EDITING...';
+        } else if (typingPause) {
+             btn.classList.add('paused');
+             btn.textContent = '⏸ TYPING...';
         } else {
             btn.classList.remove('paused');
             btn.textContent = '⏸ PAUSE';
@@ -2468,57 +2634,134 @@ def index():
 
     function togglePauseManual() {
         manualPause = !manualPause;
-        
-        // If we are resuming (manualPause became false), we should also clear the auto-pause
-        // assuming the user wants to see updates again.
-        if (!manualPause) {
-            isPaused = false;
-        }
-        
         updatePauseUI();
     }
     
-    function setPaused() {
-        // If manually paused, do nothing (keep it paused)
-        if (manualPause) return;
+    // Helper to pause when editing starts
+    function openEdit(el) {
+        if (!el) return;
+        editingPause = true;
+        updatePauseUI();
+        el.style.display = 'block';
         
-        isPaused = true;
+        // Auto-focus first input if available
+        const input = el.querySelector('input');
+        if (input) input.focus();
+    }
+
+    // Helper to resume when editing ends
+    function closeEdit(btn, el) {
+        // If btn provided, find the container
+        if (btn) {
+            el = btn.closest('div[id^=item_edit], div[id^=edit_]');
+        }
+        
+        if (el) {
+            el.style.display = 'none';
+        }
+        
+        // Check if any other edit forms are visible
+        const anyVisible = document.querySelectorAll('div[id^=item_edit][style*="display: block"], div[id^=edit_][style*="display: block"]').length > 0;
+        if (!anyVisible) {
+            editingPause = false;
+        }
         updatePauseUI();
     }
 
+    // Override toggle functions
     function toggleItemEdit(id) {
-        setPaused();
         const el = document.getElementById('item_edit_' + id);
-        if (el && el.style.display === 'none') el.style.display = 'block';
-        else if (el) el.style.display = 'none';
+        if (el) {
+            if (el.style.display === 'none' || el.style.display === '') {
+                openEdit(el);
+            } else {
+                closeEdit(null, el);
+            }
+        }
     }
 
+    function toggleEdit(id) {
+        const el = document.getElementById('edit_' + id);
+        if (el) {
+            if (el.style.display === 'none' || el.style.display === '') {
+                openEdit(el);
+            } else {
+                closeEdit(null, el);
+            }
+        }
+    }
+    
+    function addRow(containerId) {
+        // Adding a row implies editing
+        editingPause = true; 
+        updatePauseUI();
+        
+        const container = document.getElementById(containerId);
+        const div = document.createElement('div');
+        div.style.cssText = "display:flex; gap:5px; margin-bottom:5px;";
+        div.innerHTML = `
+            <input type="text" name="material" placeholder="{T('material')}" style="width:120px; background:#222; border:1px solid #444; color:#fff; padding:5px; border-radius:3px;" required>
+            <input type="number" name="quantity" placeholder="{T('quantity')}" style="width:60px; background:#222; border:1px solid #444; color:#fff; padding:5px; border-radius:3px;" required>
+            <input type="text" name="origin" placeholder="{T('origin_ph', 'ui', 'Origin (Opt)')}" style="width:100px; background:#222; border:1px solid #444; color:#fff; padding:5px; border-radius:3px;">
+            <input type="text" name="destination" placeholder="{T('destination_ph')}" style="width:120px; background:#222; border:1px solid #444; color:#fff; padding:5px; border-radius:3px;" required>
+            <button type="button" onclick="this.parentElement.remove()" style="background:#442222; color:#ff5555; border:none; padding:0 8px; cursor:pointer;">x</button>
+        `;
+        container.appendChild(div);
+        
+        // Focus the new input
+        div.querySelector('input').focus();
+    }
+    
+    function resetSession() {
+        if(confirm("{T('reset_confirm', 'ui', 'Are you sure you want to reset the session? This will clear all current missions.')}")) {
+            fetch('/reset_session', { method: 'POST' })
+            .then(r => window.location.reload());
+        }
+    }
+
+    // Focus/Blur handling for temporary typing pause
+    document.addEventListener('focus', function(e) {
+        if(e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA')) {
+            if (e.target.id === 'pauseBtn') return;
+            typingPause = true;
+            updatePauseUI();
+        }
+    }, true);
+
+    document.addEventListener('blur', function(e) {
+        if(e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA')) {
+            setTimeout(() => {
+                // Check if we moved to another input
+                const active = document.activeElement;
+                if (!active || active.tagName === 'BODY' || active.tagName === 'HTML') {
+                    typingPause = false;
+                    updatePauseUI();
+                }
+            }, 200);
+        }
+    }, true);
+
     async function updateContent() {
-        if (isPaused || manualPause) {
+        if (manualPause || editingPause || typingPause) {
             return;
         }
 
-        var active = document.activeElement;
-        if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) {
-            // Only set paused if we are NOT interacting with the pause button (which is handled separately)
-            // But activeElement is the focused element.
-            setPaused();
-            return;
-        }
-        
         try {
-            const response = await fetch(window.location.href);
+            const controller = new AbortController();
+            const to = setTimeout(() => controller.abort(), 5000);
+            const response = await fetch('/?ts=' + Date.now(), { cache: 'no-store', signal: controller.signal });
             const text = await response.text();
+            clearTimeout(to);
             
             // Double check pause after fetch
-             if (isPaused || manualPause) {
+             if (manualPause || editingPause || typingPause) {
                 return;
             }
             
             const parser = new DOMParser();
             const doc = parser.parseFromString(text, 'text/html');
             
-            // Selective Update - NO BODY REPLACEMENT
+            // Selective Update
             const headerLeft = document.querySelector('.header-left');
             if (headerLeft && doc.querySelector('.header-left')) {
                 headerLeft.innerHTML = doc.querySelector('.header-left').innerHTML;
@@ -2543,24 +2786,36 @@ def index():
             if (footerContent && doc.getElementById('footer-content')) {
                 footerContent.innerHTML = doc.getElementById('footer-content').innerHTML;
             }
+            
+            lastDomUpdateTs = Date.now();
 
         } catch (e) {
             console.error("Update failed", e);
         }
     }
     
-    document.addEventListener('focus', function(e) {
-        if(e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON')) {
-            // Ignore the pause button itself to prevent infinite loop of pausing when trying to unpause
-            if (e.target.id === 'pauseBtn') return;
-            setPaused();
-        }
-    }, true);
-    
     setInterval(updateContent, {{ REFRESH_INTERVAL_MS }});
+    
+    setInterval(function() {
+        if (!manualPause && !editingPause && !typingPause) {
+            var delta = Date.now() - lastDomUpdateTs;
+            if (delta > 20000) {
+                window.location.reload();
+            }
+        }
+    }, 5000);
+    
+    document.addEventListener('visibilitychange', function() {
+        if (!document.hidden) {
+            updateContent();
+        }
+    });
     </script>
     </div></body></html>"""
-    return render_template_string(html, REFRESH_INTERVAL_MS=REFRESH_INTERVAL_MS)
+    resp = make_response(render_template_string(html, REFRESH_INTERVAL_MS=REFRESH_INTERVAL_MS))
+    resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    resp.headers['Pragma'] = 'no-cache'
+    return resp
 
 if __name__ == '__main__':
     # Load saved config (if any) so calibration persists
@@ -2572,6 +2827,18 @@ if __name__ == '__main__':
     # Load persisted state (history, active missions)
     load_state()
     data_store["finished_fixed"] = load_finishes()
+    
+    # SAFETY: Sync processed_mission_ids with finished_fixed to prevent duplication
+    # if state file was lost/wiped but history file remains.
+    if "processed_mission_ids" not in data_store:
+        data_store["processed_mission_ids"] = []
+        
+    for f in data_store["finished_fixed"]:
+        fid = f.get("id")
+        if fid and fid not in data_store["processed_mission_ids"]:
+             data_store["processed_mission_ids"].append(fid)
+             
+    print(f"✓ {T('sync_ids', 'log', 'Synced')} {len(data_store['processed_mission_ids'])} {T('processed_ids', 'log', 'processed IDs from history')}")
     
     print("=" * 60)
     print("🚀 STAR CITIZEN HAULING MONITOR - HYBRID MODE")
