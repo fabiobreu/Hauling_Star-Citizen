@@ -1280,6 +1280,14 @@ class HaulingMonitor:
                     if not assigned and data_store.get("last_completed_mission_id"):
                         last_id = data_store["last_completed_mission_id"]
                         last_ts = data_store.get("last_completed_ts")
+                        
+                        # Fix: Ensure last_ts is datetime
+                        if isinstance(last_ts, str):
+                            try:
+                                last_ts = datetime.fromisoformat(last_ts)
+                            except ValueError:
+                                last_ts = None
+                                
                         if last_ts and (datetime.now() - last_ts) <= timedelta(seconds=30):
                             for i in range(min(20, len(history_source))):
                                 mission = history_source[i]
@@ -2072,9 +2080,30 @@ def update_container_size():
 @app.route('/')
 def index():
     # AGGREGATION LOGIC
+    # Skip duplicate UI missions when a Native mission with same title exists
+    missions = data_store.get("missions", {})
+    skip_missions = set()
+    title_map = {}
+    for mid, m_data in missions.items():
+        title = m_data.get("title")
+        source = m_data.get("source", "")
+        if not title:
+            continue
+        entry = title_map.setdefault(title, {"has_native": False, "ui_ids": []})
+        if "Native" in source:
+            entry["has_native"] = True
+        if "UI" in source:
+            entry["ui_ids"].append(mid)
+    for title, info in title_map.items():
+        if info.get("has_native") and info.get("ui_ids"):
+            for mid in info["ui_ids"]:
+                skip_missions.add(mid)
+
     summary = {}
     
-    for m_id, m_data in data_store["missions"].items():
+    for m_id, m_data in missions.items():
+        if m_id in skip_missions:
+            continue
         # Get max container size for this mission (default 32)
         mission_max_size = m_data.get("max_container_size", 32)
         
