@@ -1,0 +1,2964 @@
+import os, time, re, threading, json, sys, webbrowser, signal, hashlib
+from flask import Flask, render_template_string, request, jsonify, make_response
+from datetime import datetime, timedelta, timezone
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+    HAS_TRAY = True
+except ImportError:
+    HAS_TRAY = False
+
+
+# --- CONFIGURATION ---
+LOG_PATH = r"C:\Program Files\Roberts Space Industries\StarCitizen\LIVE\Game.log"
+WEB_PORT = 5000
+WEB_HOST = '0.0.0.0'
+REFRESH_INTERVAL_MS = 2000
+LANGUAGE = "en"
+LOG_LANGUAGE = "en" # Default log language
+
+# --- DEFAULT PATTERNS (Fallback) ---
+PATTERNS = {
+    "notification_event": "<SHUDEvent_OnNotification>",
+    "mission_id_tag": "MissionId:",
+    "notif_id_regex": r'Added notification ".*?" \[([0-9]+)\]',
+    "mission_id_regex": r'MissionId:\s*\[([a-f0-9\-]+)\]',
+    "notif_text_regex": r'Added notification "(.*?)"',
+    "contract_accepted": "Contract Accepted",
+    "contract_accepted_regex": r'Contract Accepted:\s*(.+?)(?::|\"|\[|$)',
+    "contract_canceled": "Contract Canceled",
+    "contract_abandoned": "Contract Abandoned",
+    "contract_failed": "Contract Failed",
+    "new_objective": "New Objective",
+    "objective_complete": "Objective Complete",
+    "contract_complete": "Contract Complete",
+    "contract_complete_regex": r'Contract Complete:\s*(.+?)(?::|\"|\[|$)',
+    "contract_ended_regex": r'Contract (?:Canceled|Abandoned|Failed):\s*(.+?)(?::|\"|\[|$)',
+    "reward_regex": r"Awarded\s+(\d+)\s+aUEC",
+    "scu_regex": r"(Deliver|Pickup|Dropoff|Transport|Collect)\s+(\d+)(?:[/\s]+(\d+))?\s+SCU\s+(?:of|de)?\s*([A-Za-z0-9\s\(\)\-\.]+?)\s+(?:to|at|for|towards|para|em|de)\s+([A-Za-z0-9\s\(\)\-\.]+?)(?::|\"|\[|<)",
+    "generic_regex": r"(Deliver|Pickup|Collect)\s+(.+?)\s+(?:to|at|from|para|de)\s+([A-Za-z0-9\s\-\.]+?)(?::|\"|\[|$)",
+    "marker_event": "<CLocalMissionPhaseMarker::CreateMarker>",
+    "marker_contract_tag": "contract [",
+    "marker_mission_id_regex": r"missionId \[([a-f0-9\-]+)\]",
+    "marker_contract_regex": r"contract \[([a-zA-Z0-9_]+)\]",
+    "inventory_event": "Inventory Result Item Count",
+    "inventory_count_regex": r"Item Count:\[(\d+)\]",
+    "ui_notif_event": "<UpdateNotificationItem>",
+    "ui_notif_tag": "Notification",
+    "ui_notif_id_regex": r'Notification ".*?" \[(\d+)\]'
+}
+
+if getattr(sys, 'frozen', False):
+    # Running as compiled exe
+    BASE_DIR = os.path.dirname(sys.executable)
+else:
+    # Running as script
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+CONFIG_FILE = os.path.join(BASE_DIR, 'hauling_config.json')
+
+STATE_FILE = os.path.join(BASE_DIR, 'hauling_state.json')
+FINISH_FILE = os.path.join(BASE_DIR, 'hauling_finish.json')
+LANG_DATA = {}
+
+def load_language_data():
+    global LANG_DATA, LANGUAGE
+    lang_file = os.path.join(BASE_DIR, f'hauling_lang_{LANGUAGE}.json')
+    if os.path.exists(lang_file):
+        try:
+            with open(lang_file, 'r', encoding='utf-8') as f:
+                LANG_DATA = json.load(f)
+                print(f"✓ Language loaded: {LANGUAGE} ({lang_file})")
+        except Exception as e:
+            print(f"⚠ Failed to load language file: {e}")
+    else:
+        print(f"⚠ Language file not found: {lang_file}. Using defaults.")
+
+def T(key, section='ui', default=None):
+    """Translate key"""
+    if section in LANG_DATA and key in LANG_DATA[section]:
+        return LANG_DATA[section][key]
+    return default if default is not None else key
+
+def get_container_breakdown(vol, max_size=32):
+    """Calculates the optimal container distribution for a given volume"""
+    if not vol or vol <= 0: return ""
+    
+    # Available sizes based on max_size
+    all_sizes = [32, 16, 8, 4, 2, 1]
+    
+    # Filter sizes that are <= max_size
+    try:
+        max_size = int(max_size)
+    except:
+        max_size = 32
+        
+    sizes = [s for s in all_sizes if s <= max_size]
+    
+    breakdown = []
+    remaining = vol
+    
+    for size in sizes:
+        count = remaining // size
+        if count > 0:
+            breakdown.append((count, size))
+            remaining %= size
+            
+    html_parts = []
+    for count, size in breakdown:
+        # Style: Count (Gray), Size (Purple)
+        html_parts.append(
+            f"<span style='display:inline-flex; align-items:center; margin-right:4px; border:1px solid #444; border-radius:3px; overflow:hidden;'>"
+            f"<span style='background:#333; color:#ccc; padding:1px 5px; font-family:monospace; font-size:0.8rem; font-weight:bold;'>{count}</span>"
+            f"<span style='background:#7c4dff; color:#fff; padding:1px 5px; font-family:monospace; font-size:0.8rem; font-weight:bold;'>{size}</span>"
+            f"</span>"
+        )
+        
+    return "".join(html_parts)
+
+app = Flask(__name__)
+
+def json_serial(obj):
+    """JSON serializer for objects not serializable by default json code"""
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    if isinstance(obj, set):
+        return list(obj)
+    raise TypeError(f"Type {type(obj)} not serializable")
+
+def save_state():
+        """Save current data_store to disk"""
+        try:
+            # Ensure processed_mission_ids is preserved
+            if "processed_mission_ids" not in data_store:
+                data_store["processed_mission_ids"] = []
+
+            # Create a clean copy to save
+            to_save = data_store.copy()
+            
+            # DO NOT save the persistent history into the volatile state file
+            if "finished_fixed" in to_save:
+                del to_save["finished_fixed"]
+            
+            # DEPRECATED: finished_missions should not be used anymore
+            if "finished_missions" in to_save:
+                del to_save["finished_missions"]
+
+            with open(STATE_FILE, 'w', encoding='utf-8') as f:
+                json.dump(to_save, f, default=json_serial, indent=2)
+        except Exception as e:
+            print(f"⚠ Failed to save state: {e}")
+
+def load_finishes():
+    try:
+        if os.path.exists(FINISH_FILE):
+            with open(FINISH_FILE, 'r', encoding='utf-8') as f:
+                items = json.load(f)
+                
+                # DEDUPLICATION LOGIC
+                seen_ids = set()
+                seen_rewards = set() # (value, time) tuple
+                unique_items = []
+                
+                for item in items:
+                    # 1. ID Check
+                    if item.get('id') in seen_ids:
+                        continue
+                        
+                    # 2. Reward Content Check (Handle legacy non-deterministic IDs)
+                    if item.get('source') == "LOG (Reward)":
+                        # Key: Value + Time (approximate check not needed if we assume exact time string match from same log run)
+                        # We use time string (HH:MM:SS) which is granular enough to likely catch duplicates from same log event
+                        key = (item.get('value'), item.get('time'))
+                        if key in seen_rewards:
+                            continue
+                        seen_rewards.add(key)
+                        
+                    seen_ids.add(item.get('id'))
+                    unique_items.append(item)
+                
+                # If we filtered anything, save back immediately
+                if len(unique_items) < len(items):
+                    diff = len(items) - len(unique_items)
+                    print(f"🧹 {T('dedup_log', 'log', 'Deduplicated History')}: {diff} {T('entries_removed', 'log', 'entries removed')}")
+                    save_finishes(unique_items)
+                    
+                return unique_items
+    except Exception as e:
+        print(f"⚠ Failed to load finish file: {e}")
+    return []
+
+def save_finishes(items):
+    try:
+        with open(FINISH_FILE, 'w', encoding='utf-8') as f:
+            json.dump(items, f, indent=2)
+    except Exception as e:
+        print(f"⚠ Failed to save finish file: {e}")
+
+def append_finish(entry):
+    items = load_finishes()
+    existing_idx = next((i for i, it in enumerate(items) if it.get("id") == entry.get("id")), None)
+    if existing_idx is not None:
+        items.pop(existing_idx)
+    items.insert(0, entry)
+    save_finishes(items)
+
+def update_finish_value(mid, new_value):
+    items = load_finishes()
+    updated = False
+    for it in items:
+        if it.get("id") == mid:
+            it["value"] = new_value
+            updated = True
+            break
+    if updated:
+        save_finishes(items)
+    return updated
+
+def load_state():
+    """Load data_store from disk"""
+    global data_store
+    if os.path.exists(STATE_FILE):
+        try:
+            # Check if file is empty
+            if os.path.getsize(STATE_FILE) == 0:
+                 print(f"⚠ State file {STATE_FILE} is empty. Starting fresh.")
+                 return
+
+            with open(STATE_FILE, 'r', encoding='utf-8') as f:
+                saved = json.load(f)
+                
+                # SAFETY CHECK: Ensure saved data is a dictionary
+                if not isinstance(saved, dict):
+                    print(f"⚠ Invalid state format in {STATE_FILE} (expected dict, got {type(saved).__name__}). Starting fresh.")
+                    return
+                
+                # Restore datetime objects
+                if 'session_start' in saved:
+                    try:
+                        saved_start = datetime.fromisoformat(saved['session_start'])
+                        
+                        # Check if session is from a previous day
+                        if saved_start.date() < datetime.now().date():
+                            print(f"♻️ Old session found ({saved_start.strftime('%Y-%m-%d')}). Starting fresh.")
+                            
+                            # CRITICAL: Preserve processed_mission_ids even on new day to prevent history duplication
+                            if "processed_mission_ids" in saved:
+                                data_store["processed_mission_ids"] = saved["processed_mission_ids"]
+                            
+                            # Preserve Hangar (Manual Inventory)
+                            if "hangar" in saved:
+                                data_store["hangar"] = saved["hangar"]
+                                
+                            # Preserve Private Manifests
+                            if "private_manifests" in saved:
+                                data_store["private_manifests"] = saved["private_manifests"]
+
+                            # Save the clean slate immediately to update session date
+                            save_state() 
+                            return 
+                        
+                        saved['session_start'] = saved_start
+                    except:
+                        saved['session_start'] = datetime.now()
+                
+                # Merge into data_store (preserving keys not in saved if any)
+                data_store.update(saved)
+                
+                # Ensure hangar exists
+                if "hangar" not in data_store:
+                    data_store["hangar"] = []
+
+                # Ensure processed_mission_ids exists (Prevent History Duplicates)
+                if "processed_mission_ids" not in data_store:
+                    data_store["processed_mission_ids"] = []
+                
+                # CLEANUP: Remove deprecated finished_missions if accidentally loaded
+                if "finished_missions" in data_store:
+                    del data_store["finished_missions"]
+
+                print(f"✓ State loaded from {STATE_FILE} (Session: {saved['session_start'].strftime('%H:%M')})")
+        except Exception as e:
+            print(f"⚠ Failed to load state: {e}")
+    # Always refresh fixed finishes in memory
+    data_store["finished_fixed"] = load_finishes()
+
+data_store = {
+    "missions": {}, 
+    "finished_fixed": [],
+    "hangar": [],
+    "player_name": "Waiting for Login...", 
+    "ship_name": "Waiting for Ship...",
+    "current_location": "Synchronizing...", 
+    "next_destination": "None",
+    "fuel_estimate": 0,
+    "mission_status": "READY",
+    "session_start": datetime.now(),
+    "notif_mission_map": {},
+    "last_completed_mission_id": None,
+    "last_completed_ts": None
+}
+
+def clean_location_name(raw_name):
+    """Convert log location names to readable format - Enhanced approach"""
+    if not raw_name: return "Unknown"
+    
+    name = raw_name
+    
+    # 1. Remove technical prefixes
+    name = re.sub(r'^(OOC_|ObjectContainer_)', '', name, flags=re.IGNORECASE)
+    
+    # 2. Map Internal System Names to Real Names (Stanton System)
+    # This preserves the location context (e.g. "Stanton2b_Outpost" becomes "Daymar_Outpost")
+    body_map = {
+        # Hurston & Moons
+        r'Stanton_?1a\b': "Ariel", r'Stanton_?1b\b': "Aberdeen", 
+        r'Stanton_?1c\b': "Magda", r'Stanton_?1d\b': "Ita",
+        r'Stanton_?1\b': "Hurston",
+        
+        # Crusader & Moons
+        r'Stanton_?2a\b': "Cellin", r'Stanton_?2b\b': "Daymar", r'Stanton_?2c\b': "Yela",
+        r'Stanton_?2\b': "Crusader",
+        
+        # ArcCorp & Moons
+        r'Stanton_?3a\b': "Lyria", r'Stanton_?3b\b': "Wala",
+        r'Stanton_?3\b': "ArcCorp",
+        
+        # MicroTech & Moons
+        r'Stanton_?4a\b': "Calliope", r'Stanton_?4b\b': "Clio", r'Stanton_?4c\b': "Euterpe",
+        r'Stanton_?4\b': "MicroTech",
+    }
+    
+    for pattern, real_name in body_map.items():
+        name = re.sub(pattern, real_name, name, flags=re.IGNORECASE)
+
+    # 3. Basic cleanup
+    name = name.replace('_', ' ')
+    
+    # 4. Expand Abbreviations & Fix Common Terms
+    replacements = [
+        # Specific Station Mappings (Internal Codes -> Real Names)
+        (r'\bRr\s*Hur\s*Leo\b', 'Everus Harbor'),
+        (r'\bRr\s*Mic\s*Leo\b', 'Port Tressler'),
+        (r'\bRr\s*Arc\s*Leo\b', 'Baijini Point'),
+        (r'\bRr\s*Cru\s*Leo\b', 'Seraphim Station'),
+        
+        (r'\bDistCenter\b', 'Distribution Center'),
+        (r'\bInt\b', 'Interchange'),
+        (r'\bStn\b', 'Station'),
+        (r'\bSvc\b', 'Services'),
+        (r'\bInd\b', 'Industrial'),
+        (r'\bOutpost\b', 'Outpost'),
+        (r'\bShelter\b', 'Aid Shelter'),
+        (r'\bMining\b', 'Mining Area'),
+        (r'\bProc\b', 'Processing'),
+        (r'\bRsrch\b', 'Research'),
+        (r'\bPlt\b', 'Plant'),
+        (r'\bFarm\b', 'Farms'),
+        (r'\bScrap\b', 'Scrapyard'),
+        (r'\bDepot\b', 'Depot'),
+        (r'\bLab\b', 'Labs'),
+        (r'\bPavilion\b', 'Pavilion'),
+        (r'\bObs\b', 'Observatory'),
+        (r'\bGnd\b', 'Ground'),
+        (r'\bGate\b', 'Gateway'),
+        
+        # Orbital Markers & Lagrange Points
+        (r'\bOm\b', 'OM'),
+        (r'\bL(\d+)\b', r'L\1'),
+        
+        # Stations
+        (r'\bHur\b', 'HUR'), (r'\bCru\b', 'CRU'), (r'\bArc\b', 'ARC'), (r'\bMic\b', 'MIC'),
+        (r'\bHdpc\b', 'HDPC'), (r'\bBaijini\b(?!\s*Point)', 'Baijini Point'), (r'(?<!Port\s)\bTressler\b', 'Port Tressler'),
+        (r'\bEverus\b(?!\s*Harbor)', 'Everus Harbor'), (r'\bRiker\b(?!\s*Memorial)', 'Riker Memorial'),
+        
+        # Cargo/Units
+        (r'\bScu\b', 'SCU'),
+    ]
+    
+    for pattern, repl in replacements:
+        name = re.sub(pattern, repl, name, flags=re.IGNORECASE)
+
+    # 5. Final Formatting
+    name = name.title()
+    
+    # Fix casing for specific acronyms after title()
+    uppercase_words = ["Om", "L1", "L2", "L3", "L4", "L5", "Hur", "Cru", "Arc", "Mic", "Hdpc", "Scu"]
+    for word in uppercase_words:
+        # Use regex to match whole words only to avoid replacing inside other words
+        name = re.sub(r'\b' + word + r'\b', word.upper(), name, flags=re.IGNORECASE)
+
+    return name.strip()
+
+
+def load_saved_config():
+    """Load saved config (if any) from disk and merge into globals."""
+    global LOG_PATH, WEB_PORT, WEB_HOST, REFRESH_INTERVAL_MS, PATTERNS, LANGUAGE, LOG_LANGUAGE
+    try:
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as fh:
+                cfg = json.load(fh)
+                if 'log_path' in cfg: LOG_PATH = cfg['log_path']
+                if 'web_port' in cfg: WEB_PORT = int(cfg.get('web_port', 5000))
+                if 'web_host' in cfg: WEB_HOST = cfg.get('web_host', '0.0.0.0')
+                if 'refresh_interval_ms' in cfg: REFRESH_INTERVAL_MS = int(cfg.get('refresh_interval_ms', 2000))
+                if 'language' in cfg: LANGUAGE = cfg.get('language', 'en')
+                if 'log_language' in cfg: LOG_LANGUAGE = cfg.get('log_language', 'en')
+
+                # Load external patterns based on log_language
+                pattern_file = os.path.join(BASE_DIR, f"patterns_{LOG_LANGUAGE}.json")
+                if os.path.exists(pattern_file):
+                    try:
+                        with open(pattern_file, 'r', encoding='utf-8') as pf:
+                            custom_patterns = json.load(pf)
+                            PATTERNS.update(custom_patterns)
+                            print(f"✓ Loaded patterns from {pattern_file}")
+                    except Exception as e:
+                        print(f"⚠ Failed to load pattern file {pattern_file}: {e}")
+                
+                # Merge Patterns (Legacy support)
+                if 'patterns' in cfg:
+                    PATTERNS.update(cfg['patterns'])
+                    print("✓ Loaded custom patterns from config (Legacy)")
+                    
+                return True
+    except Exception as e:
+        print(f"⚠ Failed to load config: {e}")
+    return False
+
+
+def save_config(log_path=None):
+    """Save config to disk."""
+    cfg = {}
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as fh:
+                cfg = json.load(fh)
+        except Exception:
+            cfg = {}
+
+    if log_path is not None:
+        cfg['log_path'] = log_path
+
+    try:
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as fh:
+            json.dump(cfg, fh, indent=2)
+        return True
+    except Exception as e:
+        print(f"⚠ Failed to save config: {e}")
+        return False
+
+
+
+class HaulingMonitor:
+    def __init__(self):
+        self.processed_ids = set()
+        self.processed_notification_ids = set()
+        self.last_notification_mission_id = None
+
+    def archive_specific_mission(self, stale_id, new_mission_id=None):
+        """Archives a specific active mission by ID.
+           If new_mission_id is provided, it tries to merge completion status from the stale mission.
+        """
+        if stale_id not in data_store["missions"]:
+            return
+
+        print(f"♻️ Auto-Archiving Stale Mission: {data_store['missions'][stale_id]['title']} ({stale_id})")
+        
+        # --- SMART MERGE ---
+        if new_mission_id and new_mission_id in data_store["missions"]:
+            old_items = data_store["missions"][stale_id]["items"]
+            new_items = data_store["missions"][new_mission_id]["items"]
+            
+            # Helper for fuzzy matching location
+            def is_loc_match(loc1, loc2):
+                l1, l2 = loc1.lower(), loc2.lower()
+                return l1 == l2 or l1 in l2 or l2 in l1
+
+            for k_old, v_old in old_items.items():
+                matched = False
+                # 1. Exact Key Match
+                if k_old in new_items:
+                    target_key = k_old
+                    matched = True
+                else:
+                    # 2. Fuzzy Match
+                    for k_new, v_new in new_items.items():
+                        if v_new["mat"] == v_old["mat"] and is_loc_match(v_new["dest"], v_old["dest"]):
+                            target_key = k_new
+                            matched = True
+                            break
+                
+                if matched:
+                    if v_old["status"] == "COMPLETED":
+                        print(f"♻️ Merging Completion Status: {v_old['mat']} -> {v_old['dest']}")
+                        new_items[target_key]["status"] = "COMPLETED"
+                        new_items[target_key]["delivered"] = new_items[target_key]["vol"]
+                    elif v_old["delivered"] > new_items[target_key]["delivered"]:
+                        print(f"♻️ Merging Progress: {v_old['delivered']} SCU for {v_old['dest']}")
+                        new_items[target_key]["delivered"] = v_old["delivered"]
+
+        data_store["missions"][stale_id]["status"] = "CANCELLED"
+        if "time" not in data_store["missions"][stale_id]:
+             data_store["missions"][stale_id]["time"] = time.strftime("%H:%M:%S")
+        
+        # Move to persistent history ONLY
+        append_finish(data_store["missions"][stale_id])
+        
+        # CRITICAL: Add to processed_mission_ids IMMEDIATELY to prevent Log Reader from re-adding it
+        if "processed_mission_ids" not in data_store:
+            data_store["processed_mission_ids"] = []
+        if stale_id not in data_store["processed_mission_ids"]:
+            data_store["processed_mission_ids"].append(stale_id)
+            
+        del data_store["missions"][stale_id]
+        save_state()
+
+    def archive_stale_mission(self, title, new_mission_id=None):
+        """Wrapper for backward compatibility: Archives ALL active missions with same title."""
+        stale_ids = []
+        for existing_id, existing_data in data_store["missions"].items():
+            if existing_data["title"] == title and existing_data["status"] == "ACTIVE":
+                if new_mission_id and existing_id == new_mission_id:
+                    continue
+                stale_ids.append(existing_id)
+        
+        for sid in stale_ids:
+            self.archive_specific_mission(sid, new_mission_id)
+
+    def detect_and_merge_duplicate(self, current_mission_id, item_data):
+        """
+        Checks if there is ANOTHER active mission with the same Title AND same Item (Mat+Dest+Vol).
+        """
+        if current_mission_id not in data_store["missions"]: return
+
+        current_mission = data_store["missions"][current_mission_id]
+        title = current_mission["title"]
+        
+        def is_loc_match(loc1, loc2):
+            l1, l2 = loc1.lower(), loc2.lower()
+            return l1 == l2 or l1 in l2 or l2 in l1
+
+        duplicate_found_id = None
+        for other_id, other_data in data_store["missions"].items():
+            if other_id == current_mission_id: continue
+            if other_data["status"] != "ACTIVE": continue
+
+            if other_data["title"] == title:
+                # Check items in other mission
+                for k, v in other_data["items"].items():
+                    if v["mat"] == item_data["mat"] and \
+                       is_loc_match(v["dest"], item_data["dest"]) and \
+                       v["vol"] == item_data["vol"]:
+                        duplicate_found_id = other_id
+                        break
+            if duplicate_found_id: break
+        
+        if duplicate_found_id:
+            print(f"♻️ Duplicate Mission Detected via Item Match! ({title})")
+            self.archive_specific_mission(duplicate_found_id, new_mission_id=current_mission_id)
+
+    def process_line(self, line):
+        line = line.strip()
+
+        # --- NEW: SHUDEvent Notification with MissionID (PRIORITY) ---
+        # Handles events that contain the real Backend Mission ID
+        # MODIFIED: Allow processing even if MissionId is missing (Split Log Support)
+        if PATTERNS["notification_event"] in line:
+            # Extract Notification ID to prevent duplicates in fallback logic
+            notif_id_match = re.search(PATTERNS["notif_id_regex"], line)
+            if notif_id_match:
+                self.processed_notification_ids.add(notif_id_match.group(1))
+
+            # Extract Mission ID
+            mid_match = re.search(PATTERNS["mission_id_regex"], line)
+            mission_id = mid_match.group(1) if mid_match else None
+            
+            # Extract Notification Text (Relaxed regex)
+            # Try standard regex first
+            text_match = re.search(PATTERNS["notif_text_regex"], line)
+            if not text_match:
+                # Try relaxed regex (no closing quote required)
+                text_match = re.search(r'Added notification "(.*?)(?:"|$)', line)
+
+            if text_match:
+                notification_text = text_match.group(1)
+                
+                # 1. Contract Accepted
+                if PATTERNS["contract_accepted"] in notification_text:
+                    if mission_id:
+                        title_match = re.search(PATTERNS["contract_accepted_regex"], notification_text)
+                        title = title_match.group(1).strip() if title_match else "Unknown Contract"
+                        
+                        # IDEMPOTENCY CHECK
+                        if mission_id in data_store.get("processed_mission_ids", []):
+                             # print(f"♻️ {T('source_log_native', 'ui')}: Ignored known finished mission {mission_id}")
+                             pass 
+                        elif mission_id not in data_store["missions"]:
+                            # --- TIMESTAMP CHECK ---
+                            # If log line has timestamp, ignore if too old (e.g. > 6 hours from now)
+                            # But wait, we are reading history. We compare against session_start? 
+                            # Or just ignore if > 12h old absolute?
+                            # Better: If we have multiple missions with same title, keep only the NEWEST one.
+                            
+                            # For now, let's just add it. The duplication is likely due to reading old history without a clear "End" event.
+                            
+                            data_store["missions"][mission_id] = {
+                                "id": mission_id,
+                                "title": title,
+                                "items": {},
+                                "started": time.strftime("%H:%M:%S"),
+                                "source": "LOG (Native)",
+                                "status": "ACTIVE",
+                                "explicitly_accepted": True
+                            }
+                            
+                            # AUTO-CLEANUP: Check if we already have an active mission with the SAME TITLE
+                            # MOVED TO ITEM DETECTION (Smart Merge v2) to avoid false positives with different missions sharing same title.
+                            # self.archive_stale_mission(title, new_mission_id=mission_id)
+
+                            print(f"✅ LOG (Native): Mission Accepted - {title} (ID: {mission_id})")
+                            data_store["mission_status"] = "ACTIVE"
+                            save_state()
+                        
+                # 1.5 Contract Canceled / Abandoned / Failed
+                elif any(p in notification_text for p in [PATTERNS.get("contract_canceled", "Contract Canceled"), PATTERNS.get("contract_abandoned", "Contract Abandoned"), PATTERNS.get("contract_failed", "Contract Failed")]):
+                    # Extract title
+                    title_match = re.search(PATTERNS["contract_ended_regex"], notification_text)
+                    title = title_match.group(1).strip() if title_match else None
+                    
+                    if title:
+                        print(f"🛑 Mission Ended: {title}")
+                        self.archive_stale_mission(title)
+                    elif mission_id and mission_id in data_store["missions"]:
+                        print(f"🛑 Mission Ended (ID Match): {mission_id}")
+                        self.archive_specific_mission(mission_id)
+                    save_state()
+
+                # 1.6 Contract Complete (Specific Handling for Salvage/Special Missions)
+                elif PATTERNS["contract_complete"] in notification_text:
+                    title_match = re.search(PATTERNS["contract_complete_regex"], notification_text)
+                    title = title_match.group(1).strip() if title_match else "Unknown Contract"
+                    
+                    # SALVAGE MISSION DETECTION
+                    # Keywords: Salvage Rights, Recycling, Claim, Unverified
+                    if any(k in title for k in ["Salvage Rights", "Recycling", "Claim", "Unverified"]):
+                        print(f"♻️ Salvage Mission Complete: {title}")
+                        
+                        # 1. Add to Hangar (Always, as requested by user)
+                        if "hangar" not in data_store: data_store["hangar"] = []
+                        data_store["hangar"].append({
+                            "loc": T('unknown_location', 'ui', 'Unknown Location (Edit)'),
+                            "mat": T('salvage_material', 'ui', 'Salvage Material (Edit)'),
+                            "qty": 0,
+                            "added": time.strftime("%H:%M:%S")
+                        })
+                        print(f"🏭 Added Salvage to Hangar: {title}")
+                        
+                        # 2. Handle History
+                        # Check if we have an active mission with this title or ID
+                        found_active = False
+                        if mission_id and mission_id in data_store["missions"]:
+                             found_active = True
+                             self.archive_specific_mission(mission_id)
+                        else:
+                             # Try title match
+                             for mid, mdata in list(data_store["missions"].items()):
+                                 if mdata["title"] == title:
+                                     found_active = True
+                                     self.archive_specific_mission(mid)
+                                     break
+                        
+                        if not found_active:
+                            # Create synthetic history entry if not found active
+                             hist_id = mission_id if mission_id else f"SALVAGE_{int(time.time())}"
+                             
+                             # Idempotency Check
+                             if hist_id not in data_store.get("processed_mission_ids", []):
+                                 hist_entry = {
+                                    "id": hist_id,
+                                    "title": title,
+                                    "items": { "1": { "mat": "Salvage", "dest": "Hangar", "vol": 0, "status": "COMPLETED", "type": "SALVAGE" } },
+                                    "started": time.strftime("%H:%M:%S"),
+                                    "time": time.strftime("%H:%M:%S"),
+                                    "status": "COMPLETED",
+                                    "value": 0 # Unknown value until user inputs
+                                 }
+                                 if "finished_missions" not in data_store: data_store["finished_missions"] = []
+                                 data_store["finished_missions"].insert(0, hist_entry)
+                                 append_finish(hist_entry)
+                                 
+                                 if "processed_mission_ids" not in data_store: data_store["processed_mission_ids"] = []
+                                 data_store["processed_mission_ids"].append(hist_id)
+                                 save_state()
+
+                # 2. New Objective / Objective Complete
+                elif PATTERNS["new_objective"] in notification_text or PATTERNS["objective_complete"] in notification_text:
+                    
+                    # IDEMPOTENCY CHECK: Ignore updates for known finished missions
+                    if mission_id and mission_id in data_store.get("processed_mission_ids", []):
+                         return 
+
+                    # If we have a mission_id, ensure it exists
+                    if mission_id and mission_id not in data_store["missions"]:
+                         data_store["missions"][mission_id] = {
+                            "id": mission_id,
+                            "title": "Unknown Mission (Native)",
+                            "items": {},
+                            "started": time.strftime("%H:%M:%S"),
+                            "source": "LOG (Native)",
+                            "status": "ACTIVE"
+                        }
+                    
+                    # Parse Objective
+                    obj_match = re.search(
+                        PATTERNS["scu_regex"], 
+                        notification_text, re.IGNORECASE
+                    )
+                    
+                    if obj_match:
+                        action = obj_match.group(1).upper()
+                        val1 = int(obj_match.group(2))
+                        val2 = obj_match.group(3)
+                        
+                        if val2:
+                            current = val1
+                            total = int(val2)
+                        else:
+                            current = 0 
+                            total = val1
+
+                        material = obj_match.group(4).strip().upper()
+                        location = clean_location_name(obj_match.group(5))
+                        
+                        is_pickup = action in ['COLLECT', 'PICKUP', 'RETRIEVE', 'COLETAR', 'PEGAR']
+                        type_str = "PICKUP" if is_pickup else "DELIVERY"
+                        
+                        item_key = f"{material}_{location}_{type_str}"
+                        
+                        is_complete_event = PATTERNS["objective_complete"] in notification_text
+                        status_val = "COMPLETED" if (is_complete_event or (current >= total and total > 0)) else "PENDING"
+                        
+                        # GLOBAL SEARCH FALLBACK (Smart Match)
+                        # If Mission ID is missing (Split Log), find matching item in ANY active mission
+                        target_mission_id = mission_id
+                        
+                        # Helper for fuzzy matching location
+                        def is_loc_match(loc1, loc2):
+                            l1, l2 = loc1.lower(), loc2.lower()
+                            return l1 == l2 or l1 in l2 or l2 in l1
+
+                        if not target_mission_id:
+                            # 1. Search for EXACT match
+                            for m_id, m_data in data_store["missions"].items():
+                                if item_key in m_data["items"]:
+                                    target_mission_id = m_id
+                                    print(f"🔍 Smart Match (Exact): Found item in mission {m_id}")
+                                    break
+                            
+                            # 2. Search for FUZZY match if not found
+                            if not target_mission_id:
+                                for m_id, m_data in data_store["missions"].items():
+                                    for k, v in m_data["items"].items():
+                                        if v["mat"] == material and is_loc_match(v["dest"], location):
+                                            target_mission_id = m_id
+                                            item_key = k # ADOPT EXISTING KEY
+                                            print(f"🔍 Smart Match (Fuzzy): Found item {k} in {m_id}")
+                                            break
+                                    if target_mission_id: break
+                        
+                        if target_mission_id:
+                            # Check if we need to resolve item_key locally (if mission was known but key mismatch)
+                            # e.g. "Everus Harbor" vs "Everus Harbor Harbor"
+                            if item_key not in data_store["missions"][target_mission_id]["items"]:
+                                for k, v in data_store["missions"][target_mission_id]["items"].items():
+                                    if v["mat"] == material and is_loc_match(v["dest"], location):
+                                        print(f"♻️ Key Correction: {item_key} -> {k}")
+                                        item_key = k # Adopt existing key to update it
+                                        break
+
+                            # Update existing mission
+                            # Check for MANUAL_ADD duplicates
+                            keys_to_remove = []
+                            for k, v in data_store["missions"][target_mission_id]["items"].items():
+                                if v.get("action") == "MANUAL_ADD" and v.get("mat") == material and is_loc_match(v.get("dest"), location):
+                                    keys_to_remove.append(k)
+                            
+                            for k in keys_to_remove:
+                                del data_store["missions"][target_mission_id]["items"][k]
+                                print(f"♻️ LOG Replaced Manual Item: {material} -> {location}")
+
+                            data_store["missions"][target_mission_id]["items"][item_key] = {
+                                "mat": material,
+                                "dest": location,
+                                "vol": total,
+                                "delivered": current,
+                                "status": status_val,
+                                "type": type_str,
+                                "action": action
+                            }
+                            print(f"📦 LOG (Native): Item {action} {current}/{total} {material} -> {location} [{status_val}]")
+                            save_state()
+                            
+                            # Check for duplicates via item match
+                            # Only check for duplicates if the mission was NOT explicitly accepted (i.e. it's likely a restored mission)
+                            if not data_store["missions"][target_mission_id].get("explicitly_accepted", False):
+                                self.detect_and_merge_duplicate(target_mission_id, data_store["missions"][target_mission_id]["items"][item_key])
+
+                        else:
+                            # No Mission ID and No Smart Match -> Fallback to UI Logic (likely handled by UpdateNotificationItem later)
+                            # Or create Unknown Mission here?
+                            # Better to let the UI Fallback logic handle it if it comes later, 
+                            # OR create a temporary bucket here to be safe.
+                            print(f"⚠️ LOG (Native): Orphan Objective (No ID): {material} -> {location}")
+                            pass 
+
+                    else:
+                        # 2. Try Generic/Non-SCU Regex
+                        # (Keep existing logic for generic regex, but also add Smart Match support if needed)
+                        # For brevity, leaving as is for now unless requested.
+                        pass
+
+            # --- DEBUG: MISSING INFO FROM NOTIFICATIONS ---
+            # Fallback to CLocalMissionPhaseMarker if notifications fail to provide details
+            # Log Example: Creating objective marker: ... contract [HaulCargo_AToB_NonMetal_Silicon_Stanton1_SmallGrade1]
+            if PATTERNS["marker_event"] in line and PATTERNS["marker_contract_tag"] in line:
+                mission_id_match = re.search(PATTERNS["marker_mission_id_regex"], line)
+                contract_match = re.search(PATTERNS["marker_contract_regex"], line)
+                
+                if mission_id_match and contract_match:
+                    mission_id = mission_id_match.group(1)
+                    contract_str = contract_match.group(1)
+                    
+                    # Parse contract string for details (HaulCargo_AToB_NonMetal_Silicon_Stanton1_SmallGrade1)
+                    # Format seems to be: HaulCargo_AToB_Category_Material_Location_Grade
+                    parts = contract_str.split('_')
+                    if len(parts) >= 5:
+                        material = parts[4] # Silicon
+                        # location_hint = parts[5] # Stanton1 (Generic)
+                        
+                        # IDEMPOTENCY CHECK
+                        if mission_id in data_store.get("processed_mission_ids", []):
+                            pass
+                        elif mission_id not in data_store["missions"]:
+                             data_store["missions"][mission_id] = {
+                                "id": mission_id,
+                                "title": f"Contract: {material} Haul",
+                                "items": {},
+                                "started": time.strftime("%H:%M:%S"),
+                                "source": "LOG (Marker)",
+                                "status": "ACTIVE"
+                            }
+                        
+                        # Add placeholder item if empty
+                        if not data_store["missions"][mission_id]["items"]:
+                            item_key = f"{material}_Unknown_DELIVERY"
+                            data_store["missions"][mission_id]["items"][item_key] = {
+                                "mat": material,
+                                "dest": "See Objective",
+                                "vol": 0, # Unknown quantity from this log
+                                "delivered": 0,
+                                "status": "PENDING",
+                                "type": "DELIVERY",
+                                "action": "HAUL"
+                            }
+                            print(f"📍 LOG (Marker): Found Mission Info via Marker: {material}")
+
+            # --- INVENTORY / ELEVATOR ACTIVITY (Debug/Status) ---
+            if PATTERNS["inventory_event"] in line:
+                count_match = re.search(PATTERNS["inventory_count_regex"], line)
+                if count_match:
+                    count = count_match.group(1)
+                    print(f"🏗️ LOG (Native): Cargo Elevator detected {count} items on grid.")
+                    try:
+                        cnt = int(count)
+                    except:
+                        cnt = -1
+                    if cnt == 0:
+                        cur_loc = data_store.get("current_location", "")
+                        def is_loc_match(loc1, loc2):
+                            l1, l2 = loc1.lower(), loc2.lower()
+                            return l1 == l2 or l1 in l2 or l2 in l1
+                        changed = False
+                        for m_id, m_data in list(data_store["missions"].items()):
+                            for k, v in m_data.get("items", {}).items():
+                                if v.get("type") != "PICKUP" and v.get("status") != "COMPLETED":
+                                    if cur_loc and is_loc_match(v.get("dest",""), cur_loc):
+                                        v["delivered"] = v.get("vol", 0)
+                                        v["status"] = "COMPLETED"
+                                        changed = True
+                        if changed:
+                            save_state()
+
+
+        # --- NOTIFICATION BASED PARSING (UI Logs - Fallback) ---
+        # Handle "Contract Accepted" and "New Objective" from UI notifications (when backend MissionId is missing)
+        # Format: <UpdateNotificationItem> Notification "Text..." [ID], Action: ...
+        if PATTERNS["ui_notif_event"] in line and PATTERNS["ui_notif_tag"] in line:
+            # Extract Notification ID to avoid duplicates (StartFade, Remove, etc.)
+            notif_id_match = re.search(PATTERNS["ui_notif_id_regex"], line)
+            if notif_id_match:
+                notif_id = notif_id_match.group(1)
+                if notif_id in self.processed_notification_ids:
+                    return # Already processed this notification event
+                self.processed_notification_ids.add(notif_id)
+            
+            # A. Contract Accepted (Notification)
+            if PATTERNS["contract_accepted"] in line:
+                title_match = re.search(PATTERNS["contract_accepted_regex"], line)
+                title = title_match.group(1).strip() if title_match else "Unknown Contract"
+                
+                # Generate a deterministic ID based on Notification ID (to allow persistence/deletion)
+                m_id = f"ui_{notif_id}"
+                self.last_notification_mission_id = m_id
+                
+                # IDEMPOTENCY CHECK
+                if m_id in data_store.get("processed_mission_ids", []):
+                    return
+
+                if m_id not in data_store["missions"]:
+                    data_store["missions"][m_id] = {
+                        "id": m_id,
+                        "title": title,
+                        "items": {},
+                        "started": time.strftime("%H:%M:%S"),
+                        "source": "LOG (UI)",
+                        "status": "ACTIVE"
+                    }
+                    # self.archive_stale_mission(title, new_mission_id=m_id)
+                    print(f"✅ {T('source_log_ui', 'ui')}: {T('mission_accepted', 'log')} - {title} (ID: {m_id})")
+                    data_store["mission_status"] = "ACTIVE"
+                    save_state()
+            
+            # B. New Objective (Notification)
+            elif PATTERNS["new_objective"] in line or PATTERNS["objective_complete"] in line:
+                # Regex for cargo details (English)
+                obj_match = re.search(
+                    PATTERNS["scu_regex"], 
+                    line, re.IGNORECASE
+                )
+                
+                if obj_match:
+                    # Use the last accepted mission ID, or create a catch-all if none exists
+                    m_id = self.last_notification_mission_id
+                    if not m_id:
+                        m_id = "ui_unknown_mission"
+                        self.last_notification_mission_id = m_id
+                        
+                    # IDEMPOTENCY CHECK
+                    if m_id in data_store.get("processed_mission_ids", []):
+                        return
+
+                    if m_id not in data_store["missions"]:
+                         data_store["missions"][m_id] = {
+                            "id": m_id,
+                            "title": T('unknown_mission_ui', 'ui', 'Unknown Mission (UI)'),
+                            "items": {},
+                            "started": time.strftime("%H:%M:%S"),
+                            "source": "LOG (UI)",
+                            "status": "ACTIVE"
+                        }
+
+                    action = obj_match.group(1).upper()
+                    val1 = int(obj_match.group(2))
+                    val2 = obj_match.group(3)
+                    
+                    if val2:
+                        current = val1
+                        total = int(val2)
+                    else:
+                        current = 0 
+                        total = val1
+
+                    material = obj_match.group(4).strip().upper()
+                    location = clean_location_name(obj_match.group(5))
+                    
+                    is_pickup = action in ['COLLECT', 'PICKUP', 'RETRIEVE', 'COLETAR', 'PEGAR', 'ENTREGAR', 'DEIXAR', 'TRANSPORTAR']
+                    type_str = "PICKUP" if is_pickup else "DELIVERY"
+                    
+                    item_key = f"{material}_{location}_{type_str}"
+                    
+                    # Check for MANUAL_ADD duplicates and remove them
+                    keys_to_remove = []
+                    if m_id in data_store["missions"]:
+                        for k, v in data_store["missions"][m_id]["items"].items():
+                            if v.get("action") == "MANUAL_ADD" and v.get("mat") == material and v.get("dest") == location:
+                                keys_to_remove.append(k)
+                        
+                        for k in keys_to_remove:
+                            del data_store["missions"][m_id]["items"][k]
+                            print(f"♻️ {T('log_replaced', 'log')}: {material} -> {location}")
+                    
+                    is_complete_event = PATTERNS["objective_complete"] in line
+                    
+                    # Logic: If it is "Objective Complete", FORCE status=COMPLETED
+                    status_val = "COMPLETED" if (is_complete_event or (current >= total and total > 0)) else "PENDING"
+
+                    data_store["missions"][m_id]["items"][item_key] = {
+                        "mat": material,
+                        "dest": location,
+                        "vol": total,
+                        "delivered": current,
+                        "status": status_val,
+                        "type": type_str,
+                        "action": action
+                    }
+                    print(f"📦 {T('source_log_ui', 'ui')}: {T('item_log', 'log')} {action} {current}/{total} {material} -> {location} [{status_val}]")
+                    save_state()
+
+                    # Check for duplicates via item match
+                    if m_id in data_store["missions"] and item_key in data_store["missions"][m_id]["items"]:
+                        # Only check for duplicates if the mission was NOT explicitly accepted (i.e. it's likely a restored mission)
+                        if not data_store["missions"][m_id].get("explicitly_accepted", False):
+                            self.detect_and_merge_duplicate(m_id, data_store["missions"][m_id]["items"][item_key])
+
+        # 1. IDENTITY DETECTION
+        chat_match = re.search(r"joined channel '(.+?) : (.+?)'", line)
+        if chat_match:
+            ship = chat_match.group(1).strip().upper()
+            player = chat_match.group(2).strip()
+            if data_store["ship_name"] != ship or data_store["player_name"] != player:
+                data_store["ship_name"] = ship
+                data_store["player_name"] = player
+                print(f"✓ {T('identity', 'log')}: {player} on {ship}")
+
+        # 1A. LOCATION DETECTION (Inventory Request)
+        # <RequestLocationInventory> Player[...] requested inventory for Location[Stanton1_DistributionCentre_SakuraSun_Magnolia]
+        if "<RequestLocationInventory>" in line and "Location[" in line:
+            loc_match = re.search(r"Location\[(.*?)\]", line)
+            if loc_match:
+                raw_loc = loc_match.group(1)
+                clean_loc = clean_location_name(raw_loc)
+                if data_store["current_location"] != clean_loc:
+                    data_store["current_location"] = clean_loc
+                    print(f"📍 {T('location_update', 'log')}: {clean_loc}")
+        
+        # 1B. FALLBACK: Ship detection
+        if data_store["ship_name"] == "Waiting for Ship...":
+            ship_fallback = re.search(r"(ARGO_RAFT|CONSTELLATION|CATERPILLAR|C2_HERCULES|FREELANCER|HULL_[A-E]|DRAKE_CORSAIR)_\d+", line, re.IGNORECASE)
+            if ship_fallback:
+                ship_model = ship_fallback.group(1).replace('_', ' ').upper()
+                data_store["ship_name"] = ship_model
+                print(f"✓ {T('ship_detected', 'log')}: {ship_model}")
+
+        # 3. MISSION START (Contract Accepted)
+        # <SHUDEvent_OnNotification> Added notification "Contract Accepted: Title..." ... MissionId: [ID]
+        if PATTERNS["contract_accepted"] in line and PATTERNS["mission_id_tag"] in line:
+            id_match = re.search(PATTERNS["mission_id_regex"], line)
+            title_match = re.search(PATTERNS["contract_accepted_regex"], line)
+            
+            if id_match:
+                m_id = id_match.group(1)
+                title = title_match.group(1).strip() if title_match else T('unknown_contract', 'ui', 'Unknown Contract')
+                
+                # IDEMPOTENCY CHECK: If mission is already in history/deleted, ignore it.
+                if m_id in data_store.get("processed_mission_ids", []):
+                    # print(f"♻️ {T('source_log_native', 'ui')}: Ignored known finished mission {m_id}")
+                    return False
+
+                if m_id not in data_store["missions"]:
+                    data_store["missions"][m_id] = {
+                        "id": m_id,
+                        "title": title,
+                        "items": {},
+                        "started": time.strftime("%H:%M:%S"),
+                        "source": "LOG (Native)",
+                        "status": "ACTIVE"
+                    }
+                    print(f"✅ {T('source_log_native', 'ui')}: {T('mission_accepted', 'log')} - {title} (ID: {m_id})")
+                    data_store["mission_status"] = "ACTIVE"
+                    save_state()
+
+        # 4. MISSION OBJECTIVE (Cargo Details)
+        # "New Objective: Deliver 0/9 SCU of Silicon to HDPC-Farnesway: " ... MissionId: [ID]
+        if (PATTERNS["new_objective"] in line or PATTERNS["objective_complete"] in line) and PATTERNS["mission_id_tag"] in line:
+            id_match = re.search(PATTERNS["mission_id_regex"], line)
+            
+            # Regex for cargo details (English)
+            # Added '<' to terminator list to handle timestamped logs like "...Workcenter <2025..."
+            obj_match = re.search(
+                PATTERNS["scu_regex"], 
+                line, re.IGNORECASE
+            )
+            
+            if id_match and obj_match:
+                m_id = id_match.group(1)
+                
+                # IDEMPOTENCY CHECK
+                if m_id in data_store.get("processed_mission_ids", []):
+                    return False
+
+                action = obj_match.group(1).upper()
+                val1 = int(obj_match.group(2))
+                val2 = obj_match.group(3)
+                
+                if val2:
+                    current = val1
+                    total = int(val2)
+                else:
+                    current = 0 
+                    total = val1
+
+                material = obj_match.group(4).strip().upper()
+                location = clean_location_name(obj_match.group(5))
+                
+                is_pickup = action in ['COLLECT', 'PICKUP', 'RETRIEVE', 'COLETAR', 'PEGAR', 'ENTREGAR', 'DEIXAR', 'TRANSPORTAR']
+                type_str = "PICKUP" if is_pickup else "DELIVERY"
+
+                # Ensure mission exists (handle out-of-order logs)
+                if m_id not in data_store["missions"]:
+                     data_store["missions"][m_id] = {
+                        "id": m_id,
+                        "title": T('unknown_mission', 'ui', 'Unknown Mission'),
+                        "items": {},
+                        "started": time.strftime("%H:%M:%S"),
+                        "source": "LOG (Native)",
+                        "status": "ACTIVE"
+                    }
+                
+                # Unique key for this item step
+                item_key = f"{material}_{location}_{type_str}"
+                
+                # Check for MANUAL_ADD duplicates and remove them
+                keys_to_remove = []
+                if m_id in data_store["missions"]:
+                    for k, v in data_store["missions"][m_id]["items"].items():
+                        if v.get("action") == "MANUAL_ADD" and v.get("mat") == material and v.get("dest") == location:
+                            keys_to_remove.append(k)
+                    
+                    for k in keys_to_remove:
+                        del data_store["missions"][m_id]["items"][k]
+                        print(f"♻️ LOG Replaced Manual Item: {material} -> {location}")
+
+                # Check explicit completion event
+                is_complete_event = PATTERNS["objective_complete"] in line
+                
+                # Logic: If it is "Objective Complete", FORCE status=COMPLETED
+                status_val = "COMPLETED" if (is_complete_event or (current >= total and total > 0)) else "PENDING"
+
+                data_store["missions"][m_id]["items"][item_key] = {
+                    "mat": material,
+                    "dest": location,
+                    "vol": total,
+                    "delivered": current,
+                    "status": status_val,
+                    "type": type_str,
+                    "action": action
+                }
+                print(f"📦 {T('source_log_native', 'ui')}: {T('item_log', 'log')} {action} {current}/{total} {material} -> {location}")
+                save_state()
+
+        # 5. MISSION END (Abandon/Success/Fail)
+        # <EndMission> Ending mission for player. MissionId[...] CompletionType[Abandon] Reason[...]
+        # Also handle "MissionEnded" push message
+        if ("<EndMission>" in line and "MissionId" in line) or ("<MissionEnded>" in line and "mission_id" in line):
+            
+            # Pattern A: <EndMission>
+            id_match_a = re.search(r"MissionId\[([a-f0-9\-]+)\]", line)
+            type_match_a = re.search(r"CompletionType\[(.+?)\]", line)
+            
+            # Pattern B: <MissionEnded> push message
+            id_match_b = re.search(r"mission_id ([a-f0-9\-]+)", line)
+            state_match_b = re.search(r"mission_state MISSION_STATE_([A-Z]+)", line)
+            
+            m_id = None
+            comp_type = "UNKNOWN"
+
+            if id_match_a:
+                m_id = id_match_a.group(1)
+                comp_type = type_match_a.group(1).upper() if type_match_a else "UNKNOWN"
+            elif id_match_b:
+                m_id = id_match_b.group(1)
+                raw_state = state_match_b.group(1) if state_match_b else "UNKNOWN"
+                if raw_state == "COMPLETED": comp_type = "SUCCESS"
+                elif raw_state == "ABANDONED": comp_type = "ABANDON"
+                elif raw_state == "FAILED": comp_type = "FAIL"
+                else: comp_type = raw_state
+                
+            if m_id and m_id in data_store["missions"]:
+                # Normalizar SUCCESS/COMPLETE
+                if comp_type in ["COMPLETE", "COMPLETED"]:
+                    comp_type = "SUCCESS"
+
+                print(f"🏁 {T('source_log', 'ui')}: {T('mission_finished', 'log')} - {comp_type} ({T('mission', 'ui')}: {m_id})")
+                
+                if comp_type == "SUCCESS":
+                        # Archive to history
+                        mission_data = data_store["missions"][m_id]
+                        finished_entry = {
+                            "id": m_id,
+                            "title": mission_data.get("title", T('unknown_mission', 'ui', 'Unknown Mission')),
+                            "items": mission_data.get("items", {}).copy(),
+                            "value": 0, # Placeholder, will be updated by "Awarded" log
+                            "started": mission_data.get("started", "?"),
+                            "time": time.strftime("%H:%M:%S"),
+                            "source": "LOG",
+                            "status": "COMPLETED"
+                        }
+                        # Persist to finish file ONLY
+                        append_finish(finished_entry)
+                        
+                        del data_store["missions"][m_id]
+                        
+                        # Mark as processed
+                        if "processed_mission_ids" not in data_store: data_store["processed_mission_ids"] = []
+                        if m_id not in data_store["processed_mission_ids"]:
+                            data_store["processed_mission_ids"].append(m_id)
+                            
+                        save_state()
+                        data_store["last_completed_mission_id"] = m_id
+                        data_store["last_completed_ts"] = datetime.now()
+                        
+                elif comp_type in ["ABANDON", "FAIL", "ABANDONED", "FAILED"]:
+                    # Archive to history as CANCELLED/FAILED
+                    mission_data = data_store["missions"][m_id]
+                    status_label = "CANCELLED" if comp_type in ["ABANDON", "ABANDONED"] else "FAILED"
+                    
+                    # Persist to finish file ONLY
+                    append_finish({
+                        "id": m_id,
+                        "title": mission_data.get("title", T('unknown_mission', 'ui', 'Unknown Mission')),
+                        "items": mission_data.get("items", {}).copy(),
+                        "value": 0, 
+                        "started": mission_data.get("started", "?"),
+                        "time": time.strftime("%H:%M:%S"),
+                        "source": "LOG",
+                        "status": status_label
+                    })
+
+                    # Remove active mission
+                    del data_store["missions"][m_id]
+                    
+                    # Mark as processed
+                    if "processed_mission_ids" not in data_store: data_store["processed_mission_ids"] = []
+                    if m_id not in data_store["processed_mission_ids"]:
+                        data_store["processed_mission_ids"].append(m_id)
+
+                    if not data_store["missions"]:
+                        data_store["mission_status"] = "CANCELLED"
+                    save_state()
+
+        # 6. REWARD DETECTION
+        # "Awarded 50250 aUEC: " [21]
+        if PATTERNS["notification_event"] in line:
+            nid_match = re.search(PATTERNS["notif_id_regex"], line)
+            mid_match = re.search(PATTERNS["mission_id_regex"], line)
+            if nid_match and mid_match:
+                nid = nid_match.group(1)
+                mid = mid_match.group(1)
+                data_store["notif_mission_map"][nid] = mid
+        
+        if "aUEC" in line:
+            reward_match = re.search(PATTERNS["reward_regex"], line)
+            if reward_match:
+                amount = int(reward_match.group(1))
+                
+                # Update the most recent finished mission if it exists
+                # STRATEGY: Find the most recent mission with NO reward (value=0) and fill it.
+                # This handles batch completions (e.g. 4 missions finish, then 4 rewards come).
+                # Use persistent history to ensure we find it even after restart
+                history_source = data_store.get("finished_fixed", [])
+                
+                if history_source:
+                    assigned = False
+                    
+                    if PATTERNS["ui_notif_event"] in line:
+                        ui_match = re.search(PATTERNS["ui_notif_id_regex"], line)
+                        if ui_match:
+                            ui_id = ui_match.group(1)
+                            target_mid = data_store["notif_mission_map"].get(ui_id)
+                            if target_mid:
+                                for i in range(min(20, len(history_source))):
+                                    mission = history_source[i]
+                                    if mission.get("id") == target_mid and not mission.get("value"):
+                                        mission["value"] = amount
+                                        update_finish_value(target_mid, amount)
+                                        print(f"💰 {T('source_log', 'ui')}: {T('reward_detected', 'log')}: {amount} aUEC -> {mission['title']} ({target_mid})")
+                                        assigned = True
+                                        break
+                    
+                    if not assigned and data_store.get("last_completed_mission_id"):
+                        last_id = data_store["last_completed_mission_id"]
+                        last_ts = data_store.get("last_completed_ts")
+                        
+                        # Fix: Ensure last_ts is datetime
+                        if isinstance(last_ts, str):
+                            try:
+                                last_ts = datetime.fromisoformat(last_ts)
+                            except ValueError:
+                                last_ts = None
+                                
+                        if last_ts and (datetime.now() - last_ts) <= timedelta(seconds=30):
+                            for i in range(min(20, len(history_source))):
+                                mission = history_source[i]
+                                if mission.get("id") == last_id and not mission.get("value"):
+                                    mission["value"] = amount
+                                    update_finish_value(last_id, amount)
+                                    print(f"💰 {T('source_log', 'ui')}: {T('reward_detected', 'log')}: {amount} aUEC -> {mission['title']} ({last_id})")
+                                    assigned = True
+                                    break
+                    # Check the last 10 finished missions
+                    for i in range(min(10, len(history_source))):
+                        mission = history_source[i]
+                        # If mission has no value or value is 0, assign it
+                        if not mission.get("value"):
+                            # HEURISTIC: Prevent assigning massive rewards to small/starter missions
+                            # This prevents a 1M+ reward (likely a balance glitch or untracked mission) 
+                            # from being assigned to a "Junior Rank" mission.
+                            title_upper = mission.get('title', '').upper()
+                            if amount > 500000 and ("JUNIOR" in title_upper or "SMALL" in title_upper or "LOCAL" in title_upper):
+                                 print(f"⚠️ {T('source_log', 'ui')}: {T('reward_skip', 'log', 'Skipping assignment of large reward')} ({amount}) {T('to_small_mission', 'log', 'to small mission')}: {mission['title']}")
+                                 continue
+
+                            mission["value"] = amount
+                            print(f"💰 {T('source_log', 'ui')}: {T('reward_detected', 'log')}: {amount} aUEC -> {mission['title']} ({mission['id']})")
+                            update_finish_value(mission.get("id"), mission["value"])
+                            assigned = True
+                            break
+                    
+                    if not assigned:
+                        # If all recent missions have rewards, check for duplicates.
+                        # If amount matches the most recent one, assume duplicate log and ignore.
+                        # If amount is different, maybe it's a bonus? Add to the most recent one.
+                        last_mission = history_source[0]
+                        if last_mission.get("value") == amount:
+                             print(f"💰 {T('source_log', 'ui')}: {T('reward_detected', 'log')}: {amount} aUEC (Duplicate/Ignored)")
+                        
+                        # Only merge as bonus if the new amount is SMALL (likely a bonus)
+                        # If new amount is larger than existing, assume it's a separate untracked reward.
+                        elif amount < last_mission.get("value", 0) and amount < 500000:
+                             last_mission["value"] = last_mission.get("value", 0) + amount
+                             update_finish_value(last_mission.get("id"), last_mission["value"])
+                             print(f"💰 {T('source_log', 'ui')}: {T('reward_detected', 'log')}: +{amount} aUEC -> {last_mission['title']} (Bonus)")
+                        
+                        else:
+                             # Create Orphan Reward Entry
+                             print(f"💰 {T('source_log', 'ui')}: {T('reward_detected', 'log')}: {amount} aUEC (Orphan/New)")
+                             
+                             # Deterministic ID based on log line content (prevents duplicates on re-read)
+                             # Use MD5 of the line + amount to ensure uniqueness per event but consistency across restarts
+                             line_hash = hashlib.md5(line.encode('utf-8', 'ignore')).hexdigest()[:10]
+                             
+                             orphan_entry = {
+                                "id": f"REWARD_{line_hash}",
+                                "title": f"💰 {T('reward', 'ui', 'Reward')} ({amount} aUEC)",
+                                "items": {},
+                                "value": amount,
+                                "started": time.strftime("%H:%M:%S"),
+                                "time": time.strftime("%H:%M:%S"),
+                                "status": "COMPLETED",
+                                "source": "LOG (Reward)"
+                             }
+                             history_source.insert(0, orphan_entry)
+                             append_finish(orphan_entry)
+                             if "processed_mission_ids" not in data_store: data_store["processed_mission_ids"] = []
+                             data_store["processed_mission_ids"].append(orphan_entry["id"])
+
+                    # Sync back to data_store to reflect changes in UI immediately
+                    data_store["finished_fixed"] = history_source
+
+                    save_state()
+
+        return False
+
+def background_log_reader():
+    monitor = HaulingMonitor()
+    
+    if not os.path.exists(LOG_PATH):
+        print(f"⚠ Log file not found: {LOG_PATH}")
+        return
+    
+    print(f"📖 {T('monitoring', 'log')}: {LOG_PATH}")
+    
+    with open(LOG_PATH, "r", encoding="utf-8", errors="ignore") as f:
+        # Ler os últimos 5MB para capturar missões já aceitas
+        f.seek(0, 2)
+        size = f.tell()
+        # Reduce buffer to 2MB to avoid reading too far back if user has huge log
+        # But user might have mission accepted 3h ago. 
+        # Better: Read 5MB but filter by timestamp.
+        start_pos = max(0, size - 5 * 1024 * 1024)
+        f.seek(start_pos)
+        print(f"✓ {T('reading_history', 'log')}")
+        
+        # Regex for timestamp: <2025-01-01T15:00:00.000Z>
+        ts_regex = re.compile(r'<(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})')
+        
+        # Calculate cutoff time (e.g. 12 hours ago)
+        cutoff_time = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=12)
+
+        while True:
+            line = f.readline()
+            if not line:
+                # Fim do arquivo alcançado, entrar em modo de espera (live tail)
+                time.sleep(0.5)
+                continue
+            
+            # Timestamp Check for History Reading
+            # Only apply if we are "catching up" (though we don't strictly know if we are catching up or live)
+            # But filtering old lines is generally safe if they are > 12h old.
+            ts_match = ts_regex.match(line)
+            if ts_match:
+                try:
+                    log_time = datetime.strptime(ts_match.group(1), "%Y-%m-%dT%H:%M:%S")
+                    if log_time < cutoff_time:
+                        continue # Skip old lines
+                except:
+                    pass
+
+            monitor.process_line(line)
+
+
+
+
+@app.route('/manual_add_item', methods=['POST'])
+def manual_add_item():
+    m_id = request.form.get('mission_id')
+    mats = request.form.getlist('material')
+    qtys = request.form.getlist('quantity')
+    dests = request.form.getlist('destination')
+    origins = request.form.getlist('origin') # Optional origins
+    
+    if m_id and m_id in data_store["missions"]:
+        # Zip inputs to handle multiple rows
+        # We use zip_longest or just zip if we assume UI sends consistent arrays
+        # Since these are simple inputs, they should align.
+        
+        # Ensure origins list matches length (it might be shorter if not all rows have it, 
+        # but HTML forms usually send empty strings for empty inputs if they are named correctly in the loop)
+        # Actually, getlist returns all values. If the input is in every row, we get equal length.
+        
+        count = len(mats)
+        # Pad origins if necessary (though HTML usually sends empty string)
+        while len(origins) < count:
+            origins.append("")
+
+        for i in range(count):
+            mat = mats[i]
+            qty = qtys[i]
+            dest = dests[i]
+            origin = origins[i] if i < len(origins) else ""
+            
+            if mat and qty and dest:
+                try:
+                    vol = int(qty)
+                    mat = mat.upper().strip()
+                    dest = clean_location_name(dest)
+                    
+                    # 1. Create PICKUP item if origin is specified
+                    if origin and origin.strip():
+                        clean_origin = clean_location_name(origin)
+                        pickup_key = f"{mat}_{clean_origin}_PICKUP_{int(time.time())}_{i}"
+                        data_store["missions"][m_id]["items"][pickup_key] = {
+                            "mat": mat,
+                            "dest": clean_origin, # Destination for the pickup action (where we go to pick up)
+                            "vol": vol,
+                            "delivered": 0,
+                            "status": "PENDING",
+                            "type": "PICKUP",
+                            "action": "MANUAL_ADD"
+                        }
+                        print(f"✏️ {T('manual_add', 'log')}: {T('pickup')} {vol} {mat} @ {clean_origin}")
+
+                    # 2. Create DELIVERY item
+                    item_key = f"{mat}_{dest}_DELIVERY_{int(time.time())}_{i}"
+                    
+                    data_store["missions"][m_id]["items"][item_key] = {
+                        "mat": mat,
+                        "dest": dest,
+                        "vol": vol,
+                        "delivered": 0,
+                        "status": "PENDING",
+                        "type": "DELIVERY",
+                        "action": "MANUAL_ADD"
+                    }
+                    print(f"✏️ {T('manual_add', 'log')}: {vol} {mat} -> {dest} ({T('mission', 'ui')}: {m_id})")
+                    save_state()
+                except ValueError:
+                    pass 
+            
+    return '<meta http-equiv="refresh" content="0;url=/">'
+
+@app.route('/force_complete_item', methods=['POST'])
+def force_complete_item():
+    mission_id = request.form.get('mission_id')
+    item_key = request.form.get('item_key')
+    new_qty = request.form.get('delivered_qty')
+    new_value = request.form.get('value')
+    
+    if mission_id in data_store["missions"] and item_key in data_store["missions"][mission_id]["items"]:
+        item = data_store["missions"][mission_id]["items"][item_key]
+        mission = data_store["missions"][mission_id]
+        
+        # Update Value if provided
+        if new_value:
+            try:
+                val = int(new_value)
+                mission["value"] = val
+                print(f"💰 {T('manual_update', 'log')}: {T('value', 'ui')} -> {val} aUEC")
+            except ValueError: pass
+
+        # If new quantity is provided, update it
+        if new_qty:
+            try:
+                qty_val = int(new_qty)
+                item["delivered"] = qty_val
+                # If fully delivered, mark complete
+                if qty_val >= item["vol"]:
+                    item["status"] = "COMPLETED"
+                else:
+                    item["status"] = "PENDING" # Revert to pending if quantity reduced
+                
+                print(f"✏️ {T('manual_update', 'log')}: {item['mat']} -> {qty_val}/{item['vol']}")
+            except ValueError:
+                pass
+        else:
+            # Toggle Completion if no quantity provided (Legacy behavior or fallback)
+            if item["status"] != "COMPLETED":
+                item["status"] = "COMPLETED"
+                item["delivered"] = item["vol"]
+                print(f"✅ {T('manual_complete', 'log')}: {item['mat']} -> {item['dest']}")
+            else:
+                item["status"] = "PENDING"
+                item["delivered"] = 0
+                print(f"↩️ {T('manual_revert', 'log')}: {item['mat']} -> {item['dest']}")
+        
+        # CHECK FOR FULL MISSION COMPLETION
+        # If all items are completed AND we have a value (or user forced it via value input),
+        # we can optionally archive it? 
+        # For now, let's just save. If user wants to finish mission, they can use "Delete" or wait for log.
+        # But user asked: "se dar como concluido preciso colocar o valor"
+        # If they put value, maybe they expect it to move to history?
+        # Let's check if ALL items are completed.
+        all_done = all(i["status"] == "COMPLETED" for i in mission["items"].values())
+        if all_done and new_value:
+             # Archive it!
+             print(f"🏁 {T('manual_finish', 'log', 'Manual Finish')}: {mission['title']}")
+             monitor = HaulingMonitor()
+             monitor.archive_specific_mission(mission_id)
+             # Note: archive_specific_mission calls save_state()
+
+        save_state()
+        
+    return '<meta http-equiv="refresh" content="0;url=/">'
+
+@app.route('/delete_history/<history_index>')
+def delete_history(history_index):
+    try:
+        idx = int(history_index)
+        if 0 <= idx < len(data_store.get("finished_fixed", [])):
+            removed = data_store["finished_fixed"][idx]
+            
+            # Ensure ID is in processed_mission_ids so it doesn't reappear from logs
+            if "processed_mission_ids" not in data_store: 
+                data_store["processed_mission_ids"] = []
+            
+            if "id" in removed and removed["id"] not in data_store["processed_mission_ids"]:
+                data_store["processed_mission_ids"].append(removed["id"])
+                
+            items = load_finishes()
+            items = [it for it in items if it.get("id") != removed.get("id")]
+            save_finishes(items)
+            data_store["finished_fixed"] = items
+            print(f"🗑️ {T('history_delete', 'log')}: {removed.get('title', 'Mission')}")
+            save_state()
+    except:
+        pass
+    return '<meta http-equiv="refresh" content="0;url=/">'
+
+@app.route('/delete_mission/<mission_id>')
+def delete_mission(mission_id):
+    if mission_id in data_store["missions"]:
+        del data_store["missions"][mission_id]
+        print(f"🗑️ {T('manual_delete', 'log')}: {T('mission', 'ui')} {mission_id}")
+        save_state()
+    return '<meta http-equiv="refresh" content="0;url=/">'
+
+
+
+@app.route('/add_hangar_item', methods=['POST'])
+def add_hangar_item():
+    load_state() # Ensure we have latest
+    loc = request.form.get('location')
+    mat = request.form.get('material')
+    qty = request.form.get('quantity')
+    
+    if loc and mat and qty:
+        try:
+            if "hangar" not in data_store: data_store["hangar"] = []
+            data_store["hangar"].append({
+                "loc": loc,
+                "mat": mat,
+                "qty": int(qty),
+                "added": time.strftime("%H:%M:%S")
+            })
+            save_state()
+        except ValueError:
+            pass
+    return '<meta http-equiv="refresh" content="0;url=/hangar">'
+
+@app.route('/delete_hangar_item/<int:index>')
+def delete_hangar_item(index):
+    load_state()
+    if "hangar" in data_store and 0 <= index < len(data_store["hangar"]):
+        data_store["hangar"].pop(index)
+        save_state()
+    return '<meta http-equiv="refresh" content="0;url=/hangar">'
+
+@app.route('/update_hangar_item', methods=['POST'])
+def update_hangar_item():
+    load_state()
+    idx = request.form.get('index')
+    action = request.form.get('action') # 'update' or 'sell'
+    qty = request.form.get('quantity')
+    value = request.form.get('value') # For sale
+    
+    if idx and qty and "hangar" in data_store:
+        try:
+            i = int(idx)
+            q = int(qty)
+            if 0 <= i < len(data_store["hangar"]):
+                item = data_store["hangar"][i]
+                
+                if action == 'sell':
+                    # Reduce quantity and record sale
+                    if q > 0:
+                        item['qty'] -= q
+                        # Record history
+                        if "finished_missions" not in data_store: data_store["finished_missions"] = []
+                        entry = {
+                            "id": f"SALE_{int(time.time())}",
+                            "title": f"💰 Sold: {item['mat']} ({q} SCU)",
+                            "value": int(value) if value else 0,
+                            "status": "COMPLETED",
+                            "time": time.strftime("%H:%M:%S"),
+                            "items": {
+                                "1": {
+                                    "mat": item["mat"],
+                                    "dest": item["loc"], # Local sale
+                                    "vol": q
+                                }
+                            }
+                        }
+                        data_store["finished_missions"].insert(0, entry)
+                        append_finish(entry)
+                        print(f"💰 Sold {q} SCU of {item['mat']} at {item['loc']}")
+                        
+                else: # 'update'
+                    # Just set the new quantity
+                    item['qty'] = q
+                
+                # Clean up if empty
+                if item['qty'] <= 0:
+                    data_store["hangar"].pop(i)
+                    
+                save_state()
+        except ValueError:
+            pass
+    return '<meta http-equiv="refresh" content="0;url=/hangar">'
+
+@app.route('/create_manifest', methods=['POST'])
+def create_manifest():
+    load_state()
+    idx = request.form.get('index')
+    dest = request.form.get('destination')
+    qty_str = request.form.get('quantity')
+    
+    if idx and dest and qty_str and "hangar" in data_store:
+        try:
+            i = int(idx)
+            req_qty = int(qty_str)
+            
+            if 0 <= i < len(data_store["hangar"]):
+                item = data_store["hangar"][i]
+                
+                if req_qty > 0 and req_qty <= item['qty']:
+                    # Deduct from Hangar
+                    item['qty'] -= req_qty
+                    
+                    # If empty, remove from Hangar
+                    if item['qty'] <= 0:
+                        data_store["hangar"].pop(i)
+                    
+                    # Create Route
+                    if "private_manifests" not in data_store:
+                        data_store["private_manifests"] = []
+                    
+                    data_store["private_manifests"].append({
+                        "origin": item["loc"],
+                        "destination": dest,
+                        "mat": item["mat"],
+                        "qty": req_qty,
+                        "started": time.strftime("%H:%M:%S")
+                    })
+                    print(f"🚚 Route Created: {req_qty} SCU {item['mat']} from {item['loc']} to {dest}")
+                    save_state()
+        except ValueError:
+            pass
+    return '<meta http-equiv="refresh" content="0;url=/hangar">'
+
+@app.route('/complete_manifest', methods=['POST'])
+def complete_manifest():
+    load_state()
+    idx = request.form.get('index')
+    profit = request.form.get('profit')
+    
+    if idx and profit and "private_manifests" in data_store:
+        try:
+            i = int(idx)
+            if 0 <= i < len(data_store["private_manifests"]):
+                item = data_store["private_manifests"].pop(i)
+                
+                # Add to history
+                if "finished_missions" not in data_store: data_store["finished_missions"] = []
+                entry = {
+                    "id": f"PRIVATE_{int(time.time())}",
+                    "title": f"📦 Sale: {item['mat']} ({item['qty']} SCU)",
+                    "value": int(profit),
+                    "status": "COMPLETED",
+                    "time": time.strftime("%H:%M:%S"),
+                    "items": {
+                        "1": {
+                            "mat": item["mat"],
+                            "dest": item["destination"],
+                            "vol": item["qty"]
+                        }
+                    }
+                }
+                data_store["finished_missions"].insert(0, entry)
+                append_finish(entry)
+                print(f"💰 Sold: {item['mat']} for {profit} aUEC")
+                save_state()
+        except ValueError:
+            pass
+    return '<meta http-equiv="refresh" content="0;url=/hangar">'
+
+@app.route('/delete_manifest/<int:index>')
+def delete_manifest(index):
+    load_state()
+    if "private_manifests" in data_store and 0 <= index < len(data_store["private_manifests"]):
+        item = data_store["private_manifests"].pop(index)
+        
+        # Return to hangar
+        if "hangar" not in data_store: data_store["hangar"] = []
+        data_store["hangar"].append({
+            "loc": item["origin"],
+            "mat": item["mat"],
+            "qty": item["qty"],
+            "added": time.strftime("%H:%M:%S")
+        })
+        save_state()
+    return '<meta http-equiv="refresh" content="0;url=/hangar">'
+
+@app.route('/finish_update', methods=['POST'])
+def finish_update():
+    mid = request.form.get('id')
+    val = request.form.get('value')
+    try:
+        v = int(val)
+    except:
+        v = None
+    if mid and v is not None:
+        update_finish_value(mid, v)
+        data_store["finished_fixed"] = load_finishes()
+    return '<meta http-equiv="refresh" content="0;url=/">'
+
+@app.route('/finish_delete/<mid>')
+def finish_delete(mid):
+    items = load_finishes()
+    items = [it for it in items if it.get("id") != mid]
+    save_finishes(items)
+    data_store["finished_fixed"] = items
+    if "processed_mission_ids" not in data_store:
+        data_store["processed_mission_ids"] = []
+    if mid not in data_store["processed_mission_ids"]:
+        data_store["processed_mission_ids"].append(mid)
+    save_state()
+    return '<meta http-equiv="refresh" content="0;url=/">'
+@app.route('/reset_session', methods=['POST'])
+def reset_session():
+    global data_store
+    
+    # Preserve persistent config/hangar but clear session data
+    new_store = {
+        "missions": {}, 
+        "finished_missions": [],
+        "hangar": data_store.get("hangar", []),
+        "private_manifests": data_store.get("private_manifests", []),
+        "processed_mission_ids": data_store.get("processed_mission_ids", []), # Keep the blocklist!
+        "player_name": data_store.get("player_name", "Waiting for Login..."), 
+        "ship_name": data_store.get("ship_name", "Waiting for Ship..."),
+        "current_location": data_store.get("current_location", "Synchronizing..."), 
+        "next_destination": "None",
+        "fuel_estimate": 0,
+        "mission_status": "READY",
+        "session_start": datetime.now()
+    }
+    
+    data_store = new_store
+    save_state()
+    print(f"♻️ {T('session_reset', 'log', 'Session Reset by User')}")
+    return "OK"
+
+@app.route('/hangar')
+def hangar_page():
+    """Separate Hangar / Local Cargo Page (Served on same port)"""
+    # Reload state to get latest from disk (in case Dashboard updated it)
+    load_state()
+    
+    # --- RENDER HANGAR ITEMS ---
+    hangar_html = ""
+    if "hangar" in data_store and data_store["hangar"]:
+        hangar_html += "<table style='width:100%; border-collapse:collapse; font-size:0.9rem; color:#ccc;'>"
+        hangar_html += f"<tr style='background:#222; text-align:left;'><th style='padding:5px;'>{T('location')}</th><th style='padding:5px;'>{T('material')}</th><th style='padding:5px;'>{T('quantity')}</th><th style='padding:5px;'>{T('actions', 'ui', 'Actions')}</th></tr>"
+        for i, item in enumerate(data_store["hangar"]):
+            hangar_html += f"<tr style='border-bottom:1px solid #333;'>"
+            hangar_html += f"<td style='padding:5px;'>{item['loc']}</td>"
+            hangar_html += f"<td style='padding:5px;'>{item['mat']}</td>"
+            hangar_html += f"<td style='padding:5px;'>{item['qty']} SCU</td>"
+            hangar_html += f"<td style='padding:5px; text-align:right; display:flex; gap:5px; justify-content:flex-end;'>"
+            hangar_html += f"<button onclick=\"editHangarItem('{i}', '{item['loc']}', '{item['mat']}', '{item['qty']}')\" style='background:#ffcc00; color:#000; border:none; padding:2px 5px; cursor:pointer; font-size:0.8rem; border-radius:3px;' title='{T('edit_manage', 'ui', 'Edit / Sell')}'>✏️</button>"
+            hangar_html += f"<button onclick=\"openTransport('{i}', '{item['loc']}', '{item['mat']}', '{item['qty']}')\" style='background:#00f2ff; color:#000; border:none; padding:2px 5px; cursor:pointer; font-size:0.8rem; border-radius:3px;'>🚚 {T('transport', 'ui', 'Route')}</button>"
+            hangar_html += f"<a href='/delete_hangar_item/{i}' style='color:#ff5555; text-decoration:none; padding:2px 5px; border:1px solid #ff5555; border-radius:3px; font-size:0.8rem;'>🗑️</a>"
+            hangar_html += f"</td>"
+            hangar_html += "</tr>"
+        hangar_html += "</table>"
+    else:
+        hangar_html += f"<div style='color:#666; font-style:italic; padding:10px 0;'>{T('no_hangar_items', 'ui', 'No items in hangar.')}</div>"
+
+    # --- RENDER ACTIVE TRANSPORTS (PRIVATE ROUTES) ---
+    transports_html = ""
+    if "private_manifests" in data_store and data_store["private_manifests"]:
+        transports_html += "<div style='margin-top:20px;'><b>🚛 {0}</b><hr style='border-color:#21262d; margin:5px 0;'>".format(T('active_routes', 'ui', 'Active Routes'))
+        for i, m in enumerate(data_store["private_manifests"]):
+            transports_html += f"<div style='background:#1a1a1a; padding:10px; border-radius:5px; border:1px solid #333; margin-bottom:10px;'>"
+            transports_html += f"<div style='display:flex; justify-content:space-between; margin-bottom:5px;'>"
+            transports_html += f"<span style='color:#00f2ff; font-weight:bold;'>{m['origin']} ➔ {m['destination']}</span>"
+            transports_html += f"<span style='color:#aaa;'>{m['qty']} SCU {m['mat']}</span>"
+            transports_html += f"</div>"
+            
+            # Action: Complete (Sell)
+            transports_html += f"<form action='/complete_manifest' method='post' style='display:flex; gap:5px; align-items:center; margin-top:5px;'>"
+            transports_html += f"<input type='hidden' name='index' value='{i}'>"
+            transports_html += f"<input type='number' name='profit' placeholder='{T('profit', 'ui', 'Profit (aUEC)')}' style='background:#222; border:1px solid #444; color:#fff; padding:3px; width:100px;' required>"
+            transports_html += f"<button type='submit' style='background:#00ff88; color:#000; border:none; padding:3px 10px; cursor:pointer; font-weight:bold; border-radius:3px;'>💰 {T('sell_finish', 'ui', 'Sell/Finish')}</button>"
+            transports_html += f"<a href='/delete_manifest/{i}' style='color:#ff5555; text-decoration:none; margin-left:10px; font-size:0.9rem;'>🗑️ {T('cancel', 'ui', 'Cancel')}</a>"
+            transports_html += f"</form>"
+            transports_html += f"</div>"
+        transports_html += "</div>"
+
+    # --- MAIN HTML ---
+    html = f"""
+    <!DOCTYPE html>
+    <html lang="{LANGUAGE}">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Hangar & Local Cargo</title>
+        <style>
+            body {{ font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #0d1117; color: #c9d1d9; margin: 0; padding: 20px; font-size: 14px; }}
+            .card {{ background-color: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 15px; margin-bottom: 15px; box-shadow: 0 3px 6px rgba(0,0,0,0.2); }}
+            .btn {{ display: inline-block; padding: 5px 10px; background: #238636; color: white; text-decoration: none; border-radius: 4px; font-weight: bold; border: none; cursor: pointer; }}
+            input, select {{ background-color: #0d1117; border: 1px solid #30363d; color: #c9d1d9; padding: 5px; border-radius: 4px; }}
+            .nav-header {{ display: flex; gap: 10px; margin-bottom: 20px; border-bottom: 1px solid #30363d; padding-bottom: 10px; }}
+            .nav-link {{ color: #58a6ff; text-decoration: none; padding: 5px 10px; border-radius: 4px; }}
+            .nav-link:hover {{ background: #30363d; }}
+            .nav-active {{ background: #30363d; font-weight: bold; color: #fff; }}
+        </style>
+        <script>
+        function openTransport(index, loc, mat, qty) {{
+            document.getElementById('trans_origin').value = loc;
+            document.getElementById('trans_mat').value = mat;
+            
+            const qtyInput = document.getElementById('trans_qty');
+            qtyInput.value = qty;
+            qtyInput.max = qty;
+            
+            document.getElementById('trans_index').value = index;
+            document.getElementById('transport_modal').style.display = 'block';
+        }}
+
+        function editHangarItem(index, loc, mat, qty) {{
+            document.getElementById('edit_index').value = index;
+            document.getElementById('edit_loc').textContent = loc;
+            document.getElementById('edit_mat').textContent = mat;
+            
+            // Default to update mode
+            document.getElementById('edit_qty_update').value = qty;
+            document.getElementById('edit_qty_sell').value = 0;
+            
+            // Reset to Update mode
+            const updateRadio = document.querySelector('input[name="action"][value="update"]');
+            if(updateRadio) updateRadio.checked = true;
+            toggleSaleFields(false);
+            
+            document.getElementById('update_hangar_modal').style.display = 'block';
+        }}
+
+        function toggleSaleFields(isSell) {{
+            if (isSell) {{
+                document.getElementById('field_update').style.display = 'none';
+                document.getElementById('edit_qty_update').disabled = true;
+                
+                document.getElementById('field_sell').style.display = 'block';
+                document.getElementById('edit_qty_sell').disabled = false;
+                document.getElementById('edit_qty_sell').focus();
+            }} else {{
+                document.getElementById('field_update').style.display = 'block';
+                document.getElementById('edit_qty_update').disabled = false;
+                
+                document.getElementById('field_sell').style.display = 'none';
+                document.getElementById('edit_qty_sell').disabled = true;
+                document.getElementById('edit_qty_update').focus();
+            }}
+        }}
+
+        async function updateContent() {{
+            // Pause update if user is typing
+            var active = document.activeElement;
+            if (active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA')) {{
+                return;
+            }}
+            
+            try {{
+                const response = await fetch(window.location.href);
+                const text = await response.text();
+                const parser = new DOMParser();
+                const doc = parser.parseFromString(text, 'text/html');
+                
+                // Update Hangar List
+                const hangarList = document.getElementById('hangar-list');
+                const newHangarList = doc.getElementById('hangar-list');
+                if (hangarList && newHangarList) {{
+                    hangarList.innerHTML = newHangarList.innerHTML;
+                }}
+
+                // Update Transports List
+                const transList = document.getElementById('transports-list');
+                const newTransList = doc.getElementById('transports-list');
+                if (transList && newTransList) {{
+                    transList.innerHTML = newTransList.innerHTML;
+                }}
+                
+            }} catch (e) {{ console.error("Update failed", e); }}
+        }}
+
+        setInterval(updateContent, {REFRESH_INTERVAL_MS});
+        </script>
+    </head>
+    <body>
+        <div class="nav-header">
+            <a href="/" class="nav-link">📊 {T('dashboard', 'ui', 'Dashboard')}</a>
+            <a href="/hangar" class="nav-link nav-active">🏭 {T('hangar_local', 'ui', 'Hangar / Local Cargo')}</a>
+        </div>
+
+        <div class="card">
+            <h3>🏭 {T('hangar_local', 'ui', 'Hangar / Local Cargo')}</h3>
+            <p style="color:#8b949e; font-size:0.9rem;">{T('hangar_desc', 'ui', 'Manage your private cargo and local inventory here. Create transport routes to track movements.')}</p>
+            
+            <div id="hangar-list">{hangar_html}</div>
+
+            <div style="margin-top:15px; background:#1a1a0a; padding:10px; border-radius:5px; border:1px solid #333;">
+                <b>➕ {T('add_item', 'ui', 'Add Item to Hangar')}</b>
+                <form action="/add_hangar_item" method="post" style="display:flex; gap:5px; flex-wrap:wrap; align-items:center; margin-top:5px;">
+                    <input type="text" name="location" placeholder="{T('location_ph', 'ui', 'Location')}" style="flex:1;" required>
+                    <input type="text" name="material" placeholder="{T('material')}" style="flex:1;" required>
+                    <input type="number" name="quantity" placeholder="{T('quantity')}" style="width:80px;" required>
+                    <button type="submit" class="btn">➕ {T('add', 'ui', 'Add')}</button>
+                </form>
+            </div>
+        </div>
+
+        <div id="transports-list">{transports_html}</div>
+
+        <!-- EDIT/SELL MODAL -->
+        <div id="update_hangar_modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); z-index:1000;">
+            <div style="position:absolute; top:50%; left:50%; transform:translate(-50%, -50%); background:#161b22; padding:20px; border-radius:8px; border:1px solid #30363d; width:300px;">
+                <h3 style="margin-top:0;">✏️ {T('manage_cargo', 'ui', 'Manage Cargo')}</h3>
+                <form action="/update_hangar_item" method="post">
+                    <input type="hidden" id="edit_index" name="index">
+                    
+                    <div style="margin-bottom:10px; font-size:0.9rem; color:#aaa;">
+                        <span id="edit_loc"></span> - <span id="edit_mat"></span>
+                    </div>
+                    
+                    <label style="display:block; margin-bottom:5px;">{T('action', 'ui', 'Action')}:</label>
+                    <div style="display:flex; gap:10px; margin-bottom:10px;">
+                        <label style="cursor:pointer;"><input type="radio" name="action" value="update" checked onclick="toggleSaleFields(false)"> {T('update_qty', 'ui', 'Update Qty')}</label>
+                        <label style="cursor:pointer;"><input type="radio" name="action" value="sell" onclick="toggleSaleFields(true)"> {T('sell_remove', 'ui', 'Sell / Remove')}</label>
+                    </div>
+                    
+                    <div id="field_update">
+                        <label style="display:block; margin-bottom:5px;">{T('new_quantity', 'ui', 'New Total Quantity')}:</label>
+                        <input type="number" id="edit_qty_update" name="quantity" style="width:100%; margin-bottom:15px; background:#222; border:1px solid #444; color:#fff; padding:5px;">
+                    </div>
+                    
+                    <div id="field_sell" style="display:none;">
+                        <label style="display:block; margin-bottom:5px;">{T('remove_amount', 'ui', 'Amount to Remove')}:</label>
+                        <input type="number" id="edit_qty_sell" name="quantity" style="width:100%; margin-bottom:10px; background:#222; border:1px solid #444; color:#fff; padding:5px;" disabled>
+                        
+                        <label style="display:block; margin-bottom:5px;">{T('sale_value', 'ui', 'Sale Value (aUEC)')}:</label>
+                        <input type="number" name="value" placeholder="Optional" style="width:100%; margin-bottom:15px; background:#222; border:1px solid #444; color:#ffd700; padding:5px;">
+                    </div>
+                    
+                    <div style="display:flex; justify-content:flex-end; gap:10px;">
+                        <button type="button" onclick="document.getElementById('update_hangar_modal').style.display='none'" style="background:#444; color:#fff; border:none; padding:5px 10px; border-radius:4px; cursor:pointer;">{T('cancel', 'ui', 'Cancel')}</button>
+                        <button type="submit" class="btn" style="background:#00f2ff; color:#000;">💾 {T('save', 'ui', 'Save')}</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <!-- TRANSPORT MODAL -->
+        <div id="transport_modal" style="display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); z-index:1000;">
+            <div style="position:absolute; top:50%; left:50%; transform:translate(-50%, -50%); background:#161b22; padding:20px; border-radius:8px; border:1px solid #30363d; width:300px;">
+                <h3 style="margin-top:0;">🚚 {T('create_route', 'ui', 'Create Route')}</h3>
+                <form action="/create_manifest" method="post">
+                    <input type="hidden" id="trans_index" name="index">
+                    <input type="hidden" name="from_hangar" value="true">
+                    
+                    <label style="display:block; margin-bottom:5px;">{T('origin', 'ui', 'Origin')}:</label>
+                    <input type="text" id="trans_origin" name="origin" readonly style="width:100%; margin-bottom:10px; background:#222; color:#888;">
+                    
+                    <label style="display:block; margin-bottom:5px;">{T('material')}:</label>
+                    <input type="text" id="trans_mat" name="material" readonly style="width:100%; margin-bottom:10px; background:#222; color:#888;">
+                    
+                    <label style="display:block; margin-bottom:5px;">{T('quantity')} (SCU):</label>
+                    <input type="number" id="trans_qty" name="quantity" style="width:100%; margin-bottom:10px; background:#222; border:1px solid #444; color:#fff; padding:5px;" required min="1">
+                    
+                    <label style="display:block; margin-bottom:5px;">{T('destination_ph', 'ui', 'Destination')}:</label>
+                    <input type="text" name="destination" placeholder="e.g. Area18" style="width:100%; margin-bottom:15px;" required>
+                    
+                    <div style="display:flex; justify-content:flex-end; gap:10px;">
+                        <button type="button" onclick="document.getElementById('transport_modal').style.display='none'" style="background:#444; color:#fff; border:none; padding:5px 10px; border-radius:4px; cursor:pointer;">{T('cancel', 'ui', 'Cancel')}</button>
+                        <button type="submit" class="btn" style="background:#00f2ff; color:#000;">🚀 {T('start_route', 'ui', 'Start Route')}</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+    </body>
+    </html>
+    """
+    return html
+
+@app.route('/update_container_size', methods=['POST'])
+def update_container_size():
+    m_id = request.form.get('mission_id')
+    size = request.form.get('max_size')
+    mat = request.form.get('material')
+    dest = request.form.get('destination')
+    
+    try:
+        new_size = int(size)
+    except:
+        return '<meta http-equiv="refresh" content="0;url=/">'
+
+    updated = False
+
+    # 1. Targeted Update: Material + Destination (Cross-Mission)
+    # This fixes the bug where changing one item affected the whole mission
+    if mat and dest:
+        for mid, mission in data_store["missions"].items():
+            for key, item in mission["items"].items():
+                if item.get("mat") == mat and item.get("dest") == dest:
+                    item["max_container_size"] = new_size
+                    updated = True
+                    print(f"🔧 {T('config_update', 'log', 'Config Update')}: {mat} -> {dest} [Max Size: {new_size}]")
+
+    # 2. Fallback: Mission Level (Legacy/Catch-all)
+    if not updated and m_id and m_id in data_store["missions"]:
+        data_store["missions"][m_id]["max_container_size"] = new_size
+        updated = True
+        print(f"🔧 {T('config_update', 'log', 'Config Update')}: Mission {m_id} [Max Size: {new_size}]")
+        
+    if updated:
+        save_state()
+        
+    return '<meta http-equiv="refresh" content="0;url=/">'
+
+@app.route('/')
+def index():
+    # AGGREGATION LOGIC
+    # Skip duplicate UI missions when a Native mission with same title exists
+    missions = data_store.get("missions", {})
+    skip_missions = set()
+    title_map = {}
+    for mid, m_data in missions.items():
+        title = m_data.get("title")
+        source = m_data.get("source", "")
+        if not title:
+            continue
+        entry = title_map.setdefault(title, {"has_native": False, "ui_ids": []})
+        if "Native" in source:
+            entry["has_native"] = True
+        if "UI" in source:
+            entry["ui_ids"].append(mid)
+    for title, info in title_map.items():
+        if info.get("has_native") and info.get("ui_ids"):
+            for mid in info["ui_ids"]:
+                skip_missions.add(mid)
+
+    summary = {}
+    
+    for m_id, m_data in missions.items():
+        if m_id in skip_missions:
+            continue
+        # Get max container size for this mission (default 32)
+        mission_max_size = m_data.get("max_container_size", 32)
+        
+        for item in m_data["items"].values():
+            d, m, v, status = item["dest"], item["mat"], item["vol"], item["status"]
+            delivered = item.get("delivered", 0)
+            i_type = item.get("type", "DELIVERY") # PICKUP or DELIVERY
+            
+            # Per-Item Preference > Mission Preference
+            item_max_size = item.get("max_container_size", mission_max_size)
+            
+            if d not in summary:
+                summary[d] = {}
+            
+            if m not in summary[d]:
+                summary[d][m] = {
+                    "pickup_vol": 0, 
+                    "deliver_vol": 0, 
+                    "status": "PENDING",
+                    "delivered_pickup": 0,
+                    "delivered_delivery": 0,
+                    "mission_ids": set(),
+                    "all_items_completed": True,
+                    "all_pickups_completed": True,
+                    "max_size": item_max_size # Store preference
+                }
+            
+            summary[d][m]["mission_ids"].add(m_id)
+            
+            # Check individual item completion
+            # REFINED LOGIC: Pickup items do NOT block mission completion.
+            # Only DELIVERY items must be completed.
+            if i_type != "PICKUP" and status != "COMPLETED":
+                summary[d][m]["all_items_completed"] = False
+            
+            # Track pickup completion separately for Pickup-Only groups
+            if i_type == "PICKUP" and status != "COMPLETED":
+                summary[d][m]["all_pickups_completed"] = False
+
+            # Sum up volumes based on type
+            if i_type == "PICKUP":
+                summary[d][m]["pickup_vol"] += v
+                summary[d][m]["delivered_pickup"] += delivered
+            else:
+                summary[d][m]["deliver_vol"] += v
+                summary[d][m]["delivered_delivery"] += delivered
+            
+            # Status check:
+            # 1. If it has deliveries (Destination), status depends on DELIVERY completion.
+            # 2. If it has NO deliveries (Origin), status depends on PICKUP completion.
+            
+            if summary[d][m]["deliver_vol"] > 0:
+                 if summary[d][m]["all_items_completed"]:
+                     summary[d][m]["status"] = "COMPLETED"
+                 elif summary[d][m]["delivered_delivery"] >= summary[d][m]["deliver_vol"]:
+                     summary[d][m]["status"] = "COMPLETED"
+            else:
+                 # Pickup Only Group (Origin)
+                 if summary[d][m]["all_pickups_completed"]:
+                      summary[d][m]["status"] = "COMPLETED"
+                 elif summary[d][m]["pickup_vol"] > 0 and summary[d][m]["delivered_pickup"] >= summary[d][m]["pickup_vol"]:
+                      summary[d][m]["status"] = "COMPLETED"
+
+    mission_icons = {
+        "READY": "⚪", "ACTIVE": "🟡", "COMPLETED": "✅", "CANCELLED": "🔴"
+    }
+    
+    # Calculate Totals (Earnings & Mission Time)
+    total_earnings = 0
+    total_mission_seconds = 0
+    
+    # Use persistent history for totals
+    history_source = data_store.get("finished_fixed", [])
+    
+    for f in history_source:
+        # Only count actual completed missions (not cancelled/failed)
+        # Default to COMPLETED for backward compatibility
+        if f.get("status", "COMPLETED") == "COMPLETED":
+            total_earnings += f.get("value", 0)
+            
+            start_str = f.get("started", "?")
+            end_str = f.get("time", "?")
+            
+            if start_str != "?" and end_str != "?":
+                try:
+                    t_start = datetime.strptime(start_str, "%H:%M:%S")
+                    t_end = datetime.strptime(end_str, "%H:%M:%S")
+                    
+                    # Handle crossing midnight
+                    if t_end < t_start:
+                        t_end += timedelta(days=1)
+                        
+                    total_mission_seconds += (t_end - t_start).total_seconds()
+                except ValueError:
+                    pass
+
+    earnings_str = f"{total_earnings:,} aUEC"
+    
+    m_hours = int(total_mission_seconds // 3600)
+    m_minutes = int((total_mission_seconds % 3600) // 60)
+    mission_time_str = f"{m_hours}h {m_minutes}m" if m_hours > 0 else f"{m_minutes}m"
+    
+    mission_icon = mission_icons.get(data_store["mission_status"], "⚪")
+    
+    duration = datetime.now() - data_store["session_start"]
+    hours = int(duration.total_seconds() // 3600)
+    minutes = int((duration.total_seconds() % 3600) // 60)
+    session_time = f"{hours}h {minutes}m" if hours > 0 else f"{minutes}m"
+    
+    html = (
+        "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+        f"<title>SC Hauling Monitor - {T('source_log', 'ui', 'LOG')} Mode</title>"
+        "<style>"
+        "body{background:#0b0e14;color:#a1c4d4;font-family:sans-serif;padding:20px;margin:0;}"
+        ".header{border-bottom:2px solid #00f2ff44; padding-bottom:15px; margin-bottom:20px; display:flex; justify-content:space-between; align-items:flex-start;}"
+        ".header-left{flex:1;}"
+        ".header-right{margin-left:20px;}"
+        ".status-row{display:flex; gap:15px; margin-top:10px; flex-wrap:wrap;}"
+        ".status-badge{background:#161b22; border:1px solid #30363d; padding:8px 15px; border-radius:5px; font-size:0.9rem;}"
+        ".loc-box{color:#00f2ff; font-size:1.3rem; font-weight:bold;}"
+        ".mission-status{border-left:3px solid #ffcc00; padding-left:10px;}"
+        ".card-loc{background:#161b22; border:1px solid #30363d; padding:15px; border-radius:5px; margin-bottom:15px; border-left: 5px solid #00f2ff;}"
+        ".scu-box{padding:3px 10px; border-radius:4px; font-weight:bold; font-family:monospace; font-size:0.9rem; margin-left: 5px;}"
+        ".pickup-tag{background:#ff00ff22; color:#ff00ff; border:1px solid #ff00ff44;}"
+        ".deliver-tag{background:#00f2ff22; color:#00f2ff; border:1px solid #00f2ff44;}"
+        ".COMPLETED{background:#00ff8822; color:#00ff88; border: 1px solid #00ff88; text-decoration: line-through; opacity: 0.6;}"
+        ".footer{background:#0d1117; border:1px solid #21262d; padding:15px; margin-top:30px; border-radius:5px; font-family:monospace; font-size:0.8rem;}"
+        ".info-grid{display:flex; justify-content:space-between; align-items:center; margin-top:10px; flex-wrap:wrap; gap:10px;}"
+        ".history-item{border-bottom:1px solid #21262d; padding:8px 0; display:flex; justify-content:space-between;}"
+        ".empty-state{text-align:center; padding:40px; color:#666; font-style:italic;}"
+        ".pause-btn{background:#333; color:#fff; border:1px solid #555; padding:8px 15px; cursor:pointer; border-radius:5px; font-weight:bold; font-size:0.9rem;}"
+        ".pause-btn.paused{background:#ffcc00; color:#000; border:1px solid #ffcc00; animation: pulse 2s infinite;}"
+        ".reset-btn{background:#d93025; color:#fff; border:1px solid #a61c14; padding:5px 10px; cursor:pointer; border-radius:3px; font-size:0.8rem; margin-left:10px;}"
+        "@keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.8; } 100% { opacity: 1; } }"
+        "</style></head><body>"
+        "<div class='header'>"
+        "<div class='header-left'>"
+        
+        # --- NAV HEADER ---
+        f"<div class='nav-header' style='display:flex; gap:10px; margin-bottom:10px;'>"
+        f"    <a href='/' style='color:#fff; text-decoration:none; background:#238636; padding:5px 10px; border-radius:4px; font-weight:bold;'>📊 {T('dashboard', 'ui', 'Dashboard')}</a>"
+        f"    <a href='/hangar' style='color:#58a6ff; text-decoration:none; padding:5px 10px;'>🏭 {T('hangar_local', 'ui', 'Hangar / Local Cargo')}</a>"
+        f"</div>"
+
+        f"<div class='loc-box'>📍 {T('current_location')}: {data_store['current_location']}</div>"
+        "<div class='status-row'>"
+        f"<div class='status-badge mission-status'>{mission_icon} {T('mission')}: {T(data_store['mission_status'].lower(), 'ui', data_store['mission_status'])}</div>"
+        "</div></div>"
+        "<div class='header-right'>"
+        f"<button id='pauseBtn' class='pause-btn' onclick='togglePauseManual()'>⏸ {T('pause')}</button>"
+        "</div>"
+        "</div>"
+        "<div class='info-grid'>"
+        f"<span>🚀 <b>{data_store['ship_name']}</b> | 👤 <b>{data_store['player_name']}</b></span>"
+        f"<span>💰 <b>{earnings_str}</b></span>"
+        f"<span>🏁 <b>{mission_time_str}</b></span>"
+        f"<span>⏱ {session_time}</span>"
+        "</div>"
+    )
+
+    if summary:
+        html += "<div id='mission-list'>"
+        for d, mats in summary.items():
+            html += f"<div class='card-loc'><b>📦 {T('destination')}: {d}</b>"
+            for m, data in mats.items():
+                p_vol = data["pickup_vol"]
+                d_vol = data["deliver_vol"]
+                status = data["status"]
+                
+                # Build badges
+                badges = ""
+                
+                # Check completion first to apply style
+                is_completed = (status == "COMPLETED")
+                tag_class_extra = " COMPLETED" if is_completed else ""
+                
+                # Material Name Style (Strikethrough if fully done)
+                mat_style = "text-decoration: line-through; opacity: 0.5; color: #888;" if is_completed else ""
+                
+                if p_vol > 0:
+                    p_current = data["delivered_pickup"]
+                    p_done = (p_current >= p_vol) or is_completed
+                    
+                    prefix = "✅ " if p_done else "⬇️ "
+                    vol_display = f"{p_vol} SCU"
+                    if p_current >= 0 and p_current < p_vol and not p_done:
+                         vol_display = f"{p_current}/{p_vol} SCU"
+                    if p_done:
+                         vol_display = f"{p_vol} SCU"
+                         
+                    # Badge style based on partial completion
+                    p_style_class = tag_class_extra
+                    if p_done and not is_completed:
+                         p_style_class = " COMPLETED" # Re-use completed style for green border/text
+                    
+                    # Manual Update Form (Hidden by default, toggled via badge click)
+                    # We need a unique ID for each item. Since aggregated, we pick the first one from mission_ids/items
+                    # BUT 'summary' aggregates by destination+material. There might be multiple missions contributing.
+                    # Simplification: Allow updating the FIRST matching item found.
+                    
+                    # Find a representative item key and mission id for the manual update
+                    rep_mid = next(iter(data["mission_ids"])) if data["mission_ids"] else None
+                    rep_key = None
+                    if rep_mid:
+                         for k, v in data_store["missions"][rep_mid]["items"].items():
+                              if v["mat"] == m and v["dest"] == d and v["type"] == "PICKUP":
+                                   rep_key = k
+                                   break
+                    
+                    if rep_mid and rep_key:
+                         badges += f"""
+                         <span class='scu-box pickup-tag{p_style_class}' style='cursor:pointer; {mat_style}' onclick="toggleItemEdit('{rep_mid}_{rep_key}')" title="{T('click_to_edit', 'ui', 'Click to edit quantity')}">
+                              {prefix}{T('pickup')}: {vol_display}
+                         </span>
+                         <div id="item_edit_{rep_mid}_{rep_key}" style="display:none; position:absolute; background:#111; border:1px solid #444; padding:5px; z-index:100;">
+                              <form action="/force_complete_item" method="post" style="display:flex; flex-direction:column; gap:5px;">
+                                   <input type="hidden" name="mission_id" value="{rep_mid}">
+                                   <input type="hidden" name="item_key" value="{rep_key}">
+                                   <div style="display:flex; align-items:center; gap:5px;">
+                                       <span style="color:#aaa; font-size:0.8rem;">Qty:</span>
+                                       <input type="number" name="delivered_qty" value="{p_current}" style="width:60px; background:#222; color:#fff; border:1px solid #333;" min="0" max="{p_vol}">
+                                   </div>
+                                   <div style="display:flex; gap:5px; justify-content:flex-end;">
+                                       <button type="submit" style="background:#00f2ff; color:#000; border:none; cursor:pointer; padding:2px 8px; border-radius:3px;">💾 {T('save', 'ui', 'Save')}</button>
+                                       <button type="button" onclick="closeEdit(this)" style="background:#333; color:#fff; border:none; cursor:pointer; padding:2px 8px; border-radius:3px;">X</button>
+                                   </div>
+                              </form>
+                         </div>
+                         """
+                    else:
+                         badges += f"<span class='scu-box pickup-tag{p_style_class}' style='{mat_style}'>{prefix}{T('pickup')}: {vol_display}</span>"
+                    
+                if d_vol > 0:
+                    d_current = data["delivered_delivery"]
+                    d_done = (d_current >= d_vol) or is_completed
+                    
+                    prefix = "✅ " if d_done else "⬆️ "
+                    label = T('delivered') if d_done else T('deliver')
+                    
+                    vol_display = f"{d_vol} SCU"
+                    if d_current >= 0 and not d_done: # Always show X/Y format if not done
+                         vol_display = f"{d_current}/{d_vol} SCU"
+                    if d_done:
+                         vol_display = f"{d_vol} SCU"
+
+                    # Badge style based on partial completion
+                    d_style_class = tag_class_extra
+                    if d_done and not is_completed:
+                         d_style_class = " COMPLETED"
+
+                    # Manual Update Form for Delivery
+                    rep_mid = next(iter(data["mission_ids"])) if data["mission_ids"] else None
+                    rep_key = None
+                    if rep_mid:
+                         for k, v in data_store["missions"][rep_mid]["items"].items():
+                              if v["mat"] == m and v["dest"] == d and v["type"] != "PICKUP":
+                                   rep_key = k
+                                   break
+                    
+                    if rep_mid and rep_key:
+                         badges += f"""
+                         <span class='scu-box deliver-tag{d_style_class}' style='cursor:pointer; {mat_style}' onclick="toggleItemEdit('{rep_mid}_{rep_key}')" title="{T('click_to_edit', 'ui', 'Click to edit quantity')}">
+                              {prefix}{label}: {vol_display} <small>✏️</small>
+                         </span>
+                         <div id="item_edit_{rep_mid}_{rep_key}" style="display:none; position:absolute; background:#111; border:1px solid #444; padding:5px; z-index:100;">
+                              <form action="/force_complete_item" method="post" style="display:flex; flex-direction:column; gap:5px;">
+                                   <input type="hidden" name="mission_id" value="{rep_mid}">
+                                   <input type="hidden" name="item_key" value="{rep_key}">
+                                   <div style="display:flex; align-items:center; gap:5px;">
+                                       <span style="color:#aaa; font-size:0.8rem;">Qty:</span>
+                                       <input type="number" name="delivered_qty" value="{d_current}" style="width:60px; background:#222; color:#fff; border:1px solid #333;" min="0" max="{d_vol}">
+                                   </div>
+                                   <div style="display:flex; align-items:center; gap:5px;">
+                                       <span style="color:#aaa; font-size:0.8rem;">aUEC:</span>
+                                       <input type="number" name="value" placeholder="Reward" style="width:60px; background:#222; color:#ffd700; border:1px solid #333;">
+                                   </div>
+                                   <div style="display:flex; gap:5px; justify-content:flex-end;">
+                                       <button type="submit" style="background:#00f2ff; color:#000; border:none; cursor:pointer; padding:2px 8px; border-radius:3px;">💾 {T('save', 'ui', 'Save')}</button>
+                                       <button type="button" onclick="closeEdit(this)" style="background:#333; color:#fff; border:none; cursor:pointer; padding:2px 8px; border-radius:3px;">X</button>
+                                   </div>
+                              </form>
+                         </div>
+                         """
+                    else:
+                         badges += f"<span class='scu-box deliver-tag{d_style_class}' style='{mat_style}'>{prefix}{label}: {vol_display}</span>"
+                
+                if p_vol == 0 and d_vol == 0:
+                    badges += f"<span class='scu-box' style='color:#ffcc00; border:1px solid #ffcc0044;'>⏳ {T('waiting_cargo')}</span>"
+
+                # Calculate Container Breakdown (for total volume)
+                # We prioritize delivery volume if present, otherwise pickup volume
+                target_vol = d_vol if d_vol > 0 else p_vol
+                container_html = ""
+                
+                # Retrieve max_size from aggregated data
+                max_size_pref = data.get("max_size", 32)
+                
+                if target_vol > 0:
+                     c_breakdown = get_container_breakdown(target_vol, max_size_pref)
+                     c_style = "opacity:0.3; filter:grayscale(100%); text-decoration:line-through;" if is_completed else "opacity:0.8;"
+                     
+                     # Container Size Selector (Dropdown)
+                     # We use the first mission ID found in the aggregation for the update action
+                     first_mid = next(iter(data["mission_ids"])) if data.get("mission_ids") else ""
+                     
+                     size_selector = ""
+                     if first_mid:
+                         size_options = ""
+                         for s in [32, 16, 8, 4]:
+                             sel = "selected" if s == max_size_pref else ""
+                             size_options += f"<option value='{s}' {sel}>{s}</option>"
+                         
+                         size_selector = f"""
+                         <form action="/update_container_size" method="post" style="display:inline-block; margin-left:5px;">
+                            <input type="hidden" name="mission_id" value="{first_mid}">
+                            <input type="hidden" name="material" value="{m}">
+                            <input type="hidden" name="destination" value="{d}">
+                            <select name="max_size" onchange="this.form.submit()" style="background:#222; color:#888; border:1px solid #444; font-size:0.7rem; padding:0; border-radius:3px; cursor:pointer;" title="{T('max_container_size', 'ui', 'Max Container Size')}">
+                                {size_options}
+                            </select>
+                         </form>
+                         """
+
+                     container_html = f"<div style='display:inline-flex; align-items:center; margin-left:10px; {c_style}'>{c_breakdown}{size_selector}</div>"
+
+                html += f"<div style='display:flex; justify-content:space-between; align-items:center; margin:8px 0; padding:5px 0; border-bottom:1px solid #21262d33;'>"
+                html += f"<span style='{mat_style}'>▪ {m} {container_html}</span><div style='display:flex; align-items:center; gap:10px;'>{badges}"
+                
+                # Render buttons for each linked mission
+                if "mission_ids" in data:
+                    for mid in data["mission_ids"]:
+                         html += f"<button onclick='toggleEdit(\"{mid}\")' style='background:none; border:1px solid #444; color:#888; cursor:pointer; padding:2px 6px; border-radius:3px; font-size:0.8rem;' title='Add items'>➕</button>"
+                         html += f" <a href='/delete_mission/{mid}' onclick=\"return confirm('{T('delete_confirm')}')\" style='text-decoration:none; border:1px solid #663333; color:#cc5555; padding:2px 6px; border-radius:3px; font-size:0.8rem; margin-left:5px;' title='Delete Mission'>🗑️</a>"
+                
+                html += "</div></div>"
+                
+                # Hidden Edit Form for this mission
+                if "mission_ids" in data:
+                    for mid in data["mission_ids"]:
+                        form_id = f"form_edit_{mid}"
+                        container_id = f"container_edit_{mid}"
+                        html += f"""
+                        <div id="edit_{mid}" style="display:none; background:#111; padding:10px; margin-bottom:10px; border-radius:5px; border-left:3px solid #ffcc00;">
+                            <form id="{form_id}" action="/manual_add_item" method="post">
+                                <input type="hidden" name="mission_id" value="{mid}">
+                                <div style="font-size:0.8rem; color:#aaa; margin-bottom:5px;">{T('add_items_title')}: {m}</div>
+                                <div id="{container_id}">
+                                    <div style="display:flex; gap:5px; margin-bottom:5px;">
+                                        <input type="text" name="material" placeholder="{T('material')}" style="width:100px; background:#222; border:1px solid #444; color:#fff; padding:3px; border-radius:3px;" required>
+                                        <input type="number" name="quantity" placeholder="{T('quantity')}" style="width:50px; background:#222; border:1px solid #444; color:#fff; padding:3px; border-radius:3px;" required>
+                                        <input type="text" name="origin" placeholder="{T('origin_ph', 'ui', 'Origin (Opt)')}" style="width:100px; background:#222; border:1px solid #444; color:#fff; padding:3px; border-radius:3px;">
+                                        <input type="text" name="destination" placeholder="{T('destination_ph')}" style="width:100px; background:#222; border:1px solid #444; color:#fff; padding:3px; border-radius:3px;" required>
+                                    </div>
+                                </div>
+                                <div style="margin-top:5px; display:flex; gap:10px;">
+                                    <button type="button" onclick="addRow('{container_id}')" style="background:#333; color:#ccc; border:none; padding:3px 8px; cursor:pointer; font-size:0.8rem;">+ {T('add_row')}</button>
+                                    <button type="submit" style="background:#00f2ff; color:#000; border:none; padding:3px 10px; font-weight:bold; cursor:pointer; font-size:0.8rem;">{T('save')}</button>
+                                </div>
+                            </form>
+                        </div>
+                        """
+            html += "</div>"
+        html += "</div>"
+    else:
+        html += "<div id='mission-list'></div>"
+            
+    # Also show active missions that have no items yet (just accepted)
+    # We filter out missions that are already in 'summary' (which means they have items)
+    # Missions without items are not in summary because summary is built from items.
+    
+    missions_with_items = set()
+    for m_data in data_store["missions"].values():
+        if m_data["items"]:
+            missions_with_items.add(m_data["id"])
+
+    # Also show active missions that have no items yet OR explicitly requested missions for editing
+    # We want to keep the "Add Item" form available even if the mission already has items,
+    # IF it's in a special "Manual Edit Mode" or simply always show it for active missions?
+    
+    # --- 1. NEW MISSIONS (Waiting for Cargo) ---
+    # Only show the full manual add form for missions that have NO items.
+    missions_needing_input = [m for m_id, m in data_store["missions"].items() if not m["items"]]
+    
+    html += "<div id='new-missions-list'>"
+    if missions_needing_input:
+        html += "<div class='card-loc' style='border-left: 5px solid #ffcc00; margin-top: 20px;'>"
+        html += f"<b>📝 {T('new_contracts')}</b><br><small style='color:#666'>{T('manual_add_hint')}</small>"
+        
+        for m in missions_needing_input:
+            html += f"<div style='margin:15px 0; padding:10px; background:#1a1a0a; border:1px solid #333; border-radius:5px;'>"
+            html += f"<div style='display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;'>"
+            html += f"<div style='font-weight:bold; color:#ffcc00;'>📜 {m['title']}</div>"
+            html += f"<a href='/delete_mission/{m['id']}' onclick=\"return confirm('{T('delete_confirm')}')\" style='color:#ff5555; text-decoration:none; font-size:0.8rem; border:1px solid #ff5555; padding:2px 5px; border-radius:3px;' title='{T('delete_mission')}'>🗑️ {T('delete')}</a>"
+            html += f"</div>"
+            
+            # Form with ID for JS targeting
+            form_id = f"form_{m['id']}"
+            container_id = f"container_{m['id']}"
+            
+            html += f"""
+            <form id="{form_id}" action="/manual_add_item" method="post">
+                <input type="hidden" name="mission_id" value="{m['id']}">
+                <div id="{container_id}">
+                    <div style="display:flex; gap:5px; margin-bottom:5px;">
+                        <input type="text" name="material" placeholder="{T('material')}" style="width:120px; background:#222; border:1px solid #444; color:#fff; padding:5px; border-radius:3px;" required>
+                        <input type="number" name="quantity" placeholder="{T('quantity')}" style="width:60px; background:#222; border:1px solid #444; color:#fff; padding:5px; border-radius:3px;" required>
+                        <input type="text" name="origin" placeholder="{T('origin_ph', 'ui', 'Origin (Opt)')}" style="width:100px; background:#222; border:1px solid #444; color:#fff; padding:5px; border-radius:3px;">
+                        <input type="text" name="destination" placeholder="{T('destination_ph')}" style="width:120px; background:#222; border:1px solid #444; color:#fff; padding:5px; border-radius:3px;" required>
+                    </div>
+                </div>
+                
+                <div style="margin-top:10px; display:flex; gap:10px;">
+                    <button type="button" onclick="addRow('{container_id}')" style="background:#333; color:#fff; border:1px solid #555; padding:5px 10px; cursor:pointer; border-radius:3px;">+ {T('add_row')}</button>
+                    <button type="submit" style="background:#00f2ff; color:#000; border:none; padding:5px 15px; font-weight:bold; cursor:pointer; border-radius:3px;">💾 {T('save')}</button>
+                </div>
+            </form>
+            </div>"""
+        html += "</div>"
+    html += "</div>"
+
+    # --- 2. ACTIVE MISSIONS (Edit Mode) ---
+    # Hidden by default, accessible via Main Cards
+    # We will inject a modal or hidden div structure for each active mission so user can add items later.
+    
+    active_missions_list = [m for m_id, m in data_store["missions"].items()]
+    if active_missions_list:
+        html += "<script>"
+        html += f"""
+        function addRow(containerId) {{
+            isPaused = true; 
+            updatePauseUI();
+            const container = document.getElementById(containerId);
+            const div = document.createElement('div');
+            div.style.cssText = "display:flex; gap:5px; margin-bottom:5px;";
+            div.innerHTML = `
+                <input type="text" name="material" placeholder="{T('material')}" style="width:120px; background:#222; border:1px solid #444; color:#fff; padding:5px; border-radius:3px;" onfocus="setPaused()" required>
+                <input type="number" name="quantity" placeholder="{T('quantity')}" style="width:60px; background:#222; border:1px solid #444; color:#fff; padding:5px; border-radius:3px;" onfocus="setPaused()" required>
+                <input type="text" name="origin" placeholder="{T('origin_ph', 'ui', 'Origin (Opt)')}" style="width:100px; background:#222; border:1px solid #444; color:#fff; padding:5px; border-radius:3px;" onfocus="setPaused()">
+                <input type="text" name="destination" placeholder="{T('destination_ph')}" style="width:120px; background:#222; border:1px solid #444; color:#fff; padding:5px; border-radius:3px;" onfocus="setPaused()" required>
+                <button type="button" onclick="this.parentElement.remove()" style="background:#442222; color:#ff5555; border:none; padding:0 8px; cursor:pointer;">x</button>
+            `;
+            container.appendChild(div);
+        }}
+        function toggleItemEdit(id) {{
+            setPaused();
+            const el = document.getElementById('item_edit_' + id);
+            if (el.style.display === 'none') el.style.display = 'block';
+            else el.style.display = 'none';
+        }}
+        function toggleEdit(id) {{
+            setPaused();
+            const el = document.getElementById('edit_' + id);
+            if (el.style.display === 'none') el.style.display = 'block';
+            else el.style.display = 'none';
+        }}
+        function resetSession() {{
+            if(confirm("{T('reset_confirm', 'ui', 'Are you sure you want to reset the session? This will clear all current missions.')}")) {{
+                fetch('/reset_session', {{ method: 'POST' }})
+                .then(r => window.location.reload());
+            }}
+        }}
+        """
+        html += "</script>"
+
+    if not summary and not missions_needing_input:
+        html += f"<div class='empty-state'>⏳ {T('no_active_missions')}<br><small>{T('accept_contract_hint')}</small></div>"
+
+    # --- HANGAR / LOCAL CARGO ---
+    # REMOVED: Moved to separate app (Hauling_web_Hangar.py)
+    
+    html += f"<div class='footer' id='footer-content'><b>📋 {T('mission_history')}:</b><hr style='border-color:#21262d; margin:10px 0;'>"
+    if data_store.get("finished_fixed"):
+        for i, f in enumerate(data_store["finished_fixed"][:10]):
+            mission_short = f['id'][:8] if len(f['id']) > 8 else f['id']
+            title = f.get('title', f"{T('mission')} {mission_short}")
+            value = f.get('value', 0)
+            status = f.get('status', 'COMPLETED')
+            
+            # Style based on status
+            status_color = "#00ff88" # Green for success
+            title_color = "#e6edf3"
+            value_str = f"{value:,} aUEC" if value > 0 else "---"
+
+            if status in ["CANCELLED", "ABANDONED"]:
+                status_color = "#ff5555" # Red
+                title_color = "#ff5555"
+                value_str = T('cancelled', 'ui', 'CANCELLED')
+            elif status in ["FAILED", "FAIL"]:
+                status_color = "#ff5555"
+                title_color = "#ff5555"
+                value_str = T('failed', 'ui', 'FAILED')
+            
+            # Summarize items
+            items_summary = T('no_cargo')
+            if 'items' in f and f['items']:
+                total_scu = 0
+                mats = set()
+                for item in f['items'].values():
+                    total_scu += item.get('vol', 0)
+                    mats.add(item.get('mat', 'Unknown'))
+                
+                if total_scu > 0:
+                    mat_str = ", ".join(mats)
+                    items_summary = f"{total_scu} SCU ({mat_str})"
+                else:
+                    items_summary = f"{T('items_summary')}: {len(f['items'])}"
+
+            html += (
+                f"<div class='history-item' style='flex-direction:column; align-items:flex-start; padding:10px 0;'>"
+                f"<div style='display:flex; justify-content:space-between; width:100%; margin-bottom:4px;'>"
+                f"  <span style='font-weight:bold; color:{title_color}; font-size:0.95rem;'>{title}</span>"
+                f"  <div style='display:flex; align-items:center; gap:10px;'>"
+                f"      <form action='/finish_update' method='post' style='display:inline-flex; align-items:center; gap:5px;'>"
+                f"        <input type='hidden' name='id' value='{f.get('id','')}'>"
+                f"        <input type='number' name='value' value='{value}' style='width:90px; background:#111; color:#ffd700; border:1px solid #333; padding:2px;'>"
+                f"        <button type='submit' style='background:#00f2ff; color:#000; border:none; padding:2px 6px; border-radius:3px; cursor:pointer;'>💾</button>"
+                f"      </form>"
+                f"      <a href='/finish_delete/{f.get('id','')}' onclick=\"return confirm('{T('delete_confirm')}')\" style='text-decoration:none; color:#666; font-size:0.8rem;' title='{T('delete')}'>❌</a>"
+                f"  </div>"
+                f"</div>"
+                f"<div style='display:flex; justify-content:space-between; width:100%; font-size:0.85rem; color:#8b949e;'>"
+                f"  <span>📦 {items_summary}</span>"
+                f"  <span>🕒 {f.get('time', f.get('started', 'Unknown'))}</span>"
+                f"</div>"
+                f"</div>"
+            )
+    else:
+        html += f"<div style='color:#666; font-style:italic; padding:10px 0;'>{T('no_completed_missions')}</div>"
+    
+    html += "</div>"
+    
+    html += """
+    <script>
+    var manualPause = false;
+    var editingPause = false;
+    var typingPause = false;
+    var lastDomUpdateTs = Date.now();
+
+    function updatePauseUI() {
+        const btn = document.getElementById('pauseBtn');
+        if (!btn) return;
+        
+        if (manualPause) {
+            btn.classList.add('paused');
+            btn.textContent = '▶ RESUME';
+        } else if (editingPause) {
+             btn.classList.add('paused');
+             btn.textContent = '⏸ EDITING...';
+        } else if (typingPause) {
+             btn.classList.add('paused');
+             btn.textContent = '⏸ TYPING...';
+        } else {
+            btn.classList.remove('paused');
+            btn.textContent = '⏸ PAUSE';
+        }
+    }
+
+    function togglePauseManual() {
+        manualPause = !manualPause;
+        updatePauseUI();
+    }
+    
+    // Helper to pause when editing starts
+    function openEdit(el) {
+        if (!el) return;
+        editingPause = true;
+        updatePauseUI();
+        el.style.display = 'block';
+        
+        // Auto-focus first input if available
+        const input = el.querySelector('input');
+        if (input) input.focus();
+    }
+
+    // Helper to resume when editing ends
+    function closeEdit(btn, el) {
+        // If btn provided, find the container
+        if (btn) {
+            el = btn.closest('div[id^=item_edit], div[id^=edit_]');
+        }
+        
+        if (el) {
+            el.style.display = 'none';
+        }
+        
+        // Check if any other edit forms are visible
+        const anyVisible = document.querySelectorAll('div[id^=item_edit][style*="display: block"], div[id^=edit_][style*="display: block"]').length > 0;
+        if (!anyVisible) {
+            editingPause = false;
+        }
+        updatePauseUI();
+    }
+
+    // Override toggle functions
+    function toggleItemEdit(id) {
+        const el = document.getElementById('item_edit_' + id);
+        if (el) {
+            if (el.style.display === 'none' || el.style.display === '') {
+                openEdit(el);
+            } else {
+                closeEdit(null, el);
+            }
+        }
+    }
+
+    function toggleEdit(id) {
+        const el = document.getElementById('edit_' + id);
+        if (el) {
+            if (el.style.display === 'none' || el.style.display === '') {
+                openEdit(el);
+            } else {
+                closeEdit(null, el);
+            }
+        }
+    }
+    
+    function addRow(containerId) {
+        // Adding a row implies editing
+        editingPause = true; 
+        updatePauseUI();
+        
+        const container = document.getElementById(containerId);
+        const div = document.createElement('div');
+        div.style.cssText = "display:flex; gap:5px; margin-bottom:5px;";
+        div.innerHTML = `
+            <input type="text" name="material" placeholder="{T('material')}" style="width:120px; background:#222; border:1px solid #444; color:#fff; padding:5px; border-radius:3px;" required>
+            <input type="number" name="quantity" placeholder="{T('quantity')}" style="width:60px; background:#222; border:1px solid #444; color:#fff; padding:5px; border-radius:3px;" required>
+            <input type="text" name="origin" placeholder="{T('origin_ph', 'ui', 'Origin (Opt)')}" style="width:100px; background:#222; border:1px solid #444; color:#fff; padding:5px; border-radius:3px;">
+            <input type="text" name="destination" placeholder="{T('destination_ph')}" style="width:120px; background:#222; border:1px solid #444; color:#fff; padding:5px; border-radius:3px;" required>
+            <button type="button" onclick="this.parentElement.remove()" style="background:#442222; color:#ff5555; border:none; padding:0 8px; cursor:pointer;">x</button>
+        `;
+        container.appendChild(div);
+        
+        // Focus the new input
+        div.querySelector('input').focus();
+    }
+    
+    function resetSession() {
+        if(confirm("{T('reset_confirm', 'ui', 'Are you sure you want to reset the session? This will clear all current missions.')}")) {
+            fetch('/reset_session', { method: 'POST' })
+            .then(r => window.location.reload());
+        }
+    }
+
+    // Focus/Blur handling for temporary typing pause
+    document.addEventListener('focus', function(e) {
+        if(e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA')) {
+            if (e.target.id === 'pauseBtn') return;
+            typingPause = true;
+            updatePauseUI();
+        }
+    }, true);
+
+    document.addEventListener('blur', function(e) {
+        if(e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'BUTTON' || e.target.tagName === 'SELECT' || e.target.tagName === 'TEXTAREA')) {
+            setTimeout(() => {
+                // Check if we moved to another input
+                const active = document.activeElement;
+                if (!active || active.tagName === 'BODY' || active.tagName === 'HTML') {
+                    typingPause = false;
+                    updatePauseUI();
+                }
+            }, 200);
+        }
+    }, true);
+
+    async function updateContent() {
+        if (manualPause || editingPause || typingPause) {
+            return;
+        }
+
+        try {
+            const controller = new AbortController();
+            const to = setTimeout(() => controller.abort(), 5000);
+            const response = await fetch('/?ts=' + Date.now(), { cache: 'no-store', signal: controller.signal });
+            const text = await response.text();
+            clearTimeout(to);
+            
+            // Double check pause after fetch
+             if (manualPause || editingPause || typingPause) {
+                return;
+            }
+            
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(text, 'text/html');
+            
+            // Selective Update
+            const headerLeft = document.querySelector('.header-left');
+            if (headerLeft && doc.querySelector('.header-left')) {
+                headerLeft.innerHTML = doc.querySelector('.header-left').innerHTML;
+            }
+            
+            const infoGrid = document.querySelector('.info-grid');
+            if (infoGrid && doc.querySelector('.info-grid')) {
+                infoGrid.innerHTML = doc.querySelector('.info-grid').innerHTML;
+            }
+            
+            const missionList = document.getElementById('mission-list');
+            if (missionList && doc.getElementById('mission-list')) {
+                missionList.innerHTML = doc.getElementById('mission-list').innerHTML;
+            }
+            
+            const newMissionsList = document.getElementById('new-missions-list');
+            if (newMissionsList && doc.getElementById('new-missions-list')) {
+                newMissionsList.innerHTML = doc.getElementById('new-missions-list').innerHTML;
+            }
+            
+            const footerContent = document.getElementById('footer-content');
+            if (footerContent && doc.getElementById('footer-content')) {
+                footerContent.innerHTML = doc.getElementById('footer-content').innerHTML;
+            }
+            
+            lastDomUpdateTs = Date.now();
+
+        } catch (e) {
+            console.error("Update failed", e);
+        }
+    }
+    
+    setInterval(updateContent, {{ REFRESH_INTERVAL_MS }});
+    
+    setInterval(function() {
+        if (!manualPause && !editingPause && !typingPause) {
+            var delta = Date.now() - lastDomUpdateTs;
+            if (delta > 20000) {
+                window.location.reload();
+            }
+        }
+    }, 5000);
+    
+    document.addEventListener('visibilitychange', function() {
+        if (!document.hidden) {
+            updateContent();
+        }
+    });
+    </script>
+    </div></body></html>"""
+    resp = make_response(render_template_string(html, REFRESH_INTERVAL_MS=REFRESH_INTERVAL_MS))
+    resp.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    resp.headers['Pragma'] = 'no-cache'
+    return resp
+
+if __name__ == '__main__':
+    # Load saved config (if any) so calibration persists
+    load_saved_config()
+    
+    # Load language data
+    load_language_data()
+    
+    # Load persisted state (history, active missions)
+    load_state()
+    data_store["finished_fixed"] = load_finishes()
+    
+    # SAFETY: Sync processed_mission_ids with finished_fixed to prevent duplication
+    # if state file was lost/wiped but history file remains.
+    if "processed_mission_ids" not in data_store:
+        data_store["processed_mission_ids"] = []
+        
+    for f in data_store["finished_fixed"]:
+        fid = f.get("id")
+        if fid and fid not in data_store["processed_mission_ids"]:
+             data_store["processed_mission_ids"].append(fid)
+             
+    print(f"✓ {T('sync_ids', 'log', 'Synced')} {len(data_store['processed_mission_ids'])} {T('processed_ids', 'log', 'processed IDs from history')}")
+    
+    print("=" * 60)
+    print("🚀 STAR CITIZEN HAULING MONITOR - HYBRID MODE")
+    print("=" * 60)
+    
+    dashboard_url = f"http://{WEB_HOST if WEB_HOST != '0.0.0.0' else 'localhost'}:{WEB_PORT}"
+    
+    print(f"📊 {T('dashboard', 'ui')}: {dashboard_url}")
+    print(f"⏰ {T('session_started', 'ui')}: {data_store['session_start'].strftime('%H:%M:%S')}")
+    print(f"📖 {T('log_monitoring', 'ui')}: ENABLED")
+    
+    print("=" * 60)
+    
+    # Start Log Reader in Background
+    threading.Thread(target=background_log_reader, daemon=True).start()
+    
+    # Function to run Flask
+    def run_flask():
+        app.run(host=WEB_HOST, port=WEB_PORT, debug=False, use_reloader=False)
+
+    if HAS_TRAY:
+        # --- SYSTEM TRAY IMPLEMENTATION ---
+        import ctypes
+        
+        def create_image():
+            # Generate a simple icon (Blue box with 'H')
+            width = 64
+            height = 64
+            color1 = (0, 242, 255) # Cyan
+            color2 = (13, 17, 23)  # Dark BG
+            
+            image = Image.new('RGB', (width, height), color2)
+            dc = ImageDraw.Draw(image)
+            dc.rectangle((0, 0, width, height), fill=color2)
+            dc.rectangle((10, 10, width-10, height-10), fill=color1)
+            
+            return image
+
+        def on_open(icon, item):
+            webbrowser.open(dashboard_url)
+            
+        def on_toggle_terminal(icon, item):
+            hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+            if hwnd:
+                user32 = ctypes.windll.user32
+                if user32.IsWindowVisible(hwnd):
+                    user32.ShowWindow(hwnd, 0) # SW_HIDE
+                else:
+                    user32.ShowWindow(hwnd, 5) # SW_SHOW
+                    user32.SetForegroundWindow(hwnd)
+
+        def on_restart(icon, item):
+            icon.stop()
+            print("♻️ Reiniciando serviço...")
+            if getattr(sys, 'frozen', False):
+                os.execl(sys.executable, sys.executable, *sys.argv[1:])
+            else:
+                os.execl(sys.executable, sys.executable, *sys.argv)
+
+        def on_exit(icon, item):
+            icon.stop()
+            os._exit(0)
+
+        # Create Icon
+        image = create_image()
+        menu = pystray.Menu(
+            pystray.MenuItem("🖥️ Terminal", on_toggle_terminal),
+            pystray.MenuItem(T('open_dashboard', 'ui', 'Open Dashboard'), on_open, default=True),
+            pystray.MenuItem("♻️ Reiniciar", on_restart),
+            pystray.MenuItem(T('exit', 'ui', 'Exit'), on_exit)
+        )
+        
+        icon = pystray.Icon("HaulingMonitor", image, "Hauling Monitor", menu)
+        
+        # Signal Handler for Ctrl+C
+        def handle_sigint(sig, frame):
+            print("\n🛑 Interrupção recebida (Ctrl+C). Parando...")
+            icon.stop()
+            os._exit(0)
+        signal.signal(signal.SIGINT, handle_sigint)
+        
+        # Start Flask in a Daemon Thread so it dies when main thread (Icon) dies
+        flask_thread = threading.Thread(target=run_flask, daemon=True)
+        flask_thread.start()
+        
+        print("🖥️ System Tray Icon started. Check your taskbar.")
+        
+        # Run Tray (Blocking)
+        icon.run()
+        
+    else:
+        # Fallback if no pystray (or regular console mode desired)
+        print("⚠️ System Tray not available (pystray missing). Running in console mode.")
+        run_flask()

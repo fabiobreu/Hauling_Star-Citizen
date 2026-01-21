@@ -1,4 +1,4 @@
-import os, time, re, threading, json, sys, webbrowser, signal, hashlib
+import os, time, re, threading, json, sys, webbrowser, signal, hashlib, traceback
 from flask import Flask, render_template_string, request, jsonify, make_response
 from datetime import datetime, timedelta, timezone
 try:
@@ -25,18 +25,18 @@ PATTERNS = {
     "mission_id_regex": r'MissionId:\s*\[([a-f0-9\-]+)\]',
     "notif_text_regex": r'Added notification "(.*?)"',
     "contract_accepted": "Contract Accepted",
-    "contract_accepted_regex": r'Contract Accepted:\s*(.+?)(?::|\"|\[|$)',
+    "contract_accepted_regex": r'(?:Contract Accepted|Contrato aceito|Contrato Aceito):\s*(.+?)(?::|\"|\[|$)',
     "contract_canceled": "Contract Canceled",
     "contract_abandoned": "Contract Abandoned",
     "contract_failed": "Contract Failed",
     "new_objective": "New Objective",
     "objective_complete": "Objective Complete",
     "contract_complete": "Contract Complete",
-    "contract_complete_regex": r'Contract Complete:\s*(.+?)(?::|\"|\[|$)',
-    "contract_ended_regex": r'Contract (?:Canceled|Abandoned|Failed):\s*(.+?)(?::|\"|\[|$)',
+    "contract_complete_regex": r'(?:Contract Complete|Contrato Concluído|Contrato Completo):\s*(.+?)(?::|\"|\[|$)',
+    "contract_ended_regex": r'(?:Contract|Contrato)\s*(?:Canceled|Abandoned|Failed|Cancelado|Abandonado|Falhou|Reprovado):\s*(.+?)(?::|\"|\[|$)',
     "reward_regex": r"Awarded\s+(\d+)\s+aUEC",
-    "scu_regex": r"(Deliver|Pickup|Dropoff|Transport|Collect)\s+(\d+)(?:[/\s]+(\d+))?\s+SCU\s+(?:of|de)?\s*([A-Za-z0-9\s\(\)\-\.]+?)\s+(?:to|at|for|towards|para|em|de)\s+([A-Za-z0-9\s\(\)\-\.]+?)(?::|\"|\[|<)",
-    "generic_regex": r"(Deliver|Pickup|Collect)\s+(.+?)\s+(?:to|at|from|para|de)\s+([A-Za-z0-9\s\-\.]+?)(?::|\"|\[|$)",
+    "scu_regex": r"(Deliver|Pickup|Dropoff|Transport|Collect|Entregar|Coletar|Pegar|Transportar)\s+(\d+)(?:[/\s]+(\d+))?\s+SCU\s+(?:of|de)?\s*([A-Za-z0-9\s\(\)\-\.]+?)\s+(?:to|at|for|towards|para|em|de|a)\s+([A-Za-z0-9\s\(\)\-\.]+?)(?::|\"|\[|<)",
+    "generic_regex": r"(Deliver|Pickup|Collect|Entregar|Coletar|Pegar)\s+(.+?)\s+(?:to|at|from|para|de)\s+([A-Za-z0-9\s\-\.]+?)(?::|\"|\[|$)",
     "marker_event": "<CLocalMissionPhaseMarker::CreateMarker>",
     "marker_contract_tag": "contract [",
     "marker_mission_id_regex": r"missionId \[([a-f0-9\-]+)\]",
@@ -299,6 +299,30 @@ data_store = {
     "last_completed_ts": None
 }
 
+def is_material_match(m1, m2):
+    """
+    Fuzzy match for material names, handling singular/plural and case.
+    e.g. "STIM" matches "STIMS", "IRON" matches "IRON ORE" (maybe?)
+    For now, strict prefix/plural logic to avoid false positives.
+    """
+    if not m1 or not m2: return False
+    m1, m2 = m1.upper().strip(), m2.upper().strip()
+    if m1 == m2: return True
+    
+    # Plural check (S)
+    if m1 + "S" == m2: return True
+    if m2 + "S" == m1: return True
+    
+    # Plural check (ES) - e.g. Box -> Boxes
+    if m1 + "ES" == m2: return True
+    if m2 + "ES" == m1: return True
+    
+    return False
+
+def get_item_signature(item_data):
+    """Generate a unique signature for an item to track deletions."""
+    return f"{item_data.get('mat', '').upper().strip()}|{item_data.get('dest', '').strip()}|{item_data.get('vol', 0)}|{item_data.get('type', 'DELIVERY')}"
+
 def clean_location_name(raw_name):
     """Convert log location names to readable format - Enhanced approach"""
     if not raw_name: return "Unknown"
@@ -344,24 +368,40 @@ def clean_location_name(raw_name):
         (r'\bRr\s*Cru\s*Leo\b', 'Seraphim Station'),
         
         (r'\bDistCenter\b', 'Distribution Center'),
+        (r'\bCentro\s+De\s+Distribui[çc][ãa]o\b', 'Distribution Center'),
         (r'\bInt\b', 'Interchange'),
         (r'\bStn\b', 'Station'),
+        (r'\bEsta[çc][ãa]o\b', 'Station'),
         (r'\bSvc\b', 'Services'),
         (r'\bInd\b', 'Industrial'),
         (r'\bOutpost\b', 'Outpost'),
+        (r'\bPosto\s+Avan[çc]ado\b', 'Outpost'),
         (r'\bShelter\b', 'Aid Shelter'),
+        (r'\bAbrigo\b', 'Aid Shelter'),
         (r'\bMining\b', 'Mining Area'),
+        (r'\bMinera[çc][ãa]o\b', 'Mining Area'),
         (r'\bProc\b', 'Processing'),
+        (r'\bProcessamento\b', 'Processing'),
         (r'\bRsrch\b', 'Research'),
+        (r'\bPesquisa\b', 'Research'),
         (r'\bPlt\b', 'Plant'),
+        (r'\bPlanta\b', 'Plant'),
         (r'\bFarm\b', 'Farms'),
+        (r'\bFazenda\b', 'Farms'),
         (r'\bScrap\b', 'Scrapyard'),
+        (r'\bSucata\b', 'Scrapyard'),
         (r'\bDepot\b', 'Depot'),
+        (r'\bDep[óo]sito\b', 'Depot'),
         (r'\bLab\b', 'Labs'),
+        (r'\bLaborat[óo]rio\b', 'Labs'),
         (r'\bPavilion\b', 'Pavilion'),
+        (r'\bPavilh[ãa]o\b', 'Pavilion'),
         (r'\bObs\b', 'Observatory'),
+        (r'\bObservat[óo]rio\b', 'Observatory'),
         (r'\bGnd\b', 'Ground'),
         (r'\bGate\b', 'Gateway'),
+        (r'\bPortal\b', 'Gateway'),
+        (r'\bRefinaria\b', 'Refinery'),
         
         # Orbital Markers & Lagrange Points
         (r'\bOm\b', 'OM'),
@@ -454,6 +494,7 @@ class HaulingMonitor:
     def __init__(self):
         self.processed_ids = set()
         self.processed_notification_ids = set()
+        self.processed_reward_ids = set()
         self.last_notification_mission_id = None
 
     def archive_specific_mission(self, stale_id, new_mission_id=None):
@@ -547,7 +588,7 @@ class HaulingMonitor:
             if other_data["title"] == title:
                 # Check items in other mission
                 for k, v in other_data["items"].items():
-                    if v["mat"] == item_data["mat"] and \
+                    if is_material_match(v["mat"], item_data["mat"]) and \
                        is_loc_match(v["dest"], item_data["dest"]) and \
                        v["vol"] == item_data["vol"]:
                         duplicate_found_id = other_id
@@ -574,6 +615,10 @@ class HaulingMonitor:
             mid_match = re.search(PATTERNS["mission_id_regex"], line)
             mission_id = mid_match.group(1) if mid_match else None
             
+            # Extract Objective ID (for uniqueness of identical items)
+            obj_id_match = re.search(r'ObjectiveId:\s*\[(.*?)\]', line)
+            objective_id = obj_id_match.group(1) if obj_id_match else None
+
             # Extract Notification Text (Relaxed regex)
             # Try standard regex first
             text_match = re.search(PATTERNS["notif_text_regex"], line)
@@ -585,13 +630,23 @@ class HaulingMonitor:
                 notification_text = text_match.group(1)
                 
                 # 1. Contract Accepted
-                if PATTERNS["contract_accepted"] in notification_text:
+                is_contract_accepted = PATTERNS["contract_accepted"].lower() in notification_text.lower()
+
+                if is_contract_accepted:
                     if mission_id:
                         title_match = re.search(PATTERNS["contract_accepted_regex"], notification_text)
                         title = title_match.group(1).strip() if title_match else "Unknown Contract"
                         
                         # IDEMPOTENCY CHECK
-                        if mission_id in data_store.get("processed_mission_ids", []):
+                        # Check against history (finished_fixed) to allow re-adding "deleted" active missions
+                        is_finished = False
+                        if "finished_fixed" in data_store:
+                            for fh in data_store["finished_fixed"]:
+                                if fh.get("id") == mission_id:
+                                    is_finished = True
+                                    break
+                        
+                        if is_finished:
                              # print(f"♻️ {T('source_log_native', 'ui')}: Ignored known finished mission {mission_id}")
                              pass 
                         elif mission_id not in data_store["missions"]:
@@ -613,16 +668,28 @@ class HaulingMonitor:
                                 "explicitly_accepted": True
                             }
                             
-                            # AUTO-CLEANUP: Check if we already have an active mission with the SAME TITLE
-                            # MOVED TO ITEM DETECTION (Smart Merge v2) to avoid false positives with different missions sharing same title.
-                            # self.archive_stale_mission(title, new_mission_id=mission_id)
+                            # AUTO-CLEANUP: Smart Merge v1
+                            # If we have a MANUAL/UI mission with the SAME TITLE, we assume the LOG (Native)
+                            # is the correct one (it has the valid ID) and we merge/replace the manual one.
+                            to_remove = []
+                            
+                            # CRITICAL FIX: Iterate over a COPY of items to prevent "dictionary changed size during iteration"
+                            # This was causing the log reader to crash silently when multiple missions existed.
+                            for existing_id, existing_mission in list(data_store["missions"].items()):
+                                if existing_mission["title"] == title and existing_mission.get("source") in ["MANUAL", "UI", "LOG (UI)"]:
+                                    to_remove.append(existing_id)
+                            
+                            for rem_id in to_remove:
+                                if rem_id in data_store["missions"]: # Double check
+                                    del data_store["missions"][rem_id]
+                                    print(f"🔄 {T('smart_merge', 'log', 'Smart Merge')}: {T('replaced_manual', 'log', 'Replaced Manual/UI entry with Log entry')} ({rem_id} -> {mission_id})")
 
                             print(f"✅ LOG (Native): Mission Accepted - {title} (ID: {mission_id})")
                             data_store["mission_status"] = "ACTIVE"
                             save_state()
                         
                 # 1.5 Contract Canceled / Abandoned / Failed
-                elif any(p in notification_text for p in [PATTERNS.get("contract_canceled", "Contract Canceled"), PATTERNS.get("contract_abandoned", "Contract Abandoned"), PATTERNS.get("contract_failed", "Contract Failed")]):
+                elif any(PATTERNS.get(key, "").lower() in notification_text.lower() for key in ["contract_canceled", "contract_abandoned", "contract_failed"]):
                     # Extract title
                     title_match = re.search(PATTERNS["contract_ended_regex"], notification_text)
                     title = title_match.group(1).strip() if title_match else None
@@ -636,7 +703,7 @@ class HaulingMonitor:
                     save_state()
 
                 # 1.6 Contract Complete (Specific Handling for Salvage/Special Missions)
-                elif PATTERNS["contract_complete"] in notification_text:
+                elif PATTERNS["contract_complete"].lower() in notification_text.lower():
                     title_match = re.search(PATTERNS["contract_complete_regex"], notification_text)
                     title = title_match.group(1).strip() if title_match else "Unknown Contract"
                     
@@ -693,10 +760,20 @@ class HaulingMonitor:
                                  save_state()
 
                 # 2. New Objective / Objective Complete
-                elif PATTERNS["new_objective"] in notification_text or PATTERNS["objective_complete"] in notification_text:
+                elif (
+                    PATTERNS["new_objective"].lower() in notification_text.lower() or 
+                    PATTERNS["objective_complete"].lower() in notification_text.lower()
+                ):
                     
                     # IDEMPOTENCY CHECK: Ignore updates for known finished missions
-                    if mission_id and mission_id in data_store.get("processed_mission_ids", []):
+                    is_finished = False
+                    if mission_id and "finished_fixed" in data_store:
+                         for fh in data_store["finished_fixed"]:
+                             if fh.get("id") == mission_id:
+                                 is_finished = True
+                                 break
+                    
+                    if is_finished:
                          return 
 
                     # If we have a mission_id, ensure it exists
@@ -731,12 +808,17 @@ class HaulingMonitor:
                         material = obj_match.group(4).strip().upper()
                         location = clean_location_name(obj_match.group(5))
                         
-                        is_pickup = action in ['COLLECT', 'PICKUP', 'RETRIEVE', 'COLETAR', 'PEGAR']
+                        is_pickup = action in ['COLLECT', 'PICKUP', 'RETRIEVE', 'COLETAR', 'PEGAR', 'TRANSPORTAR', 'PEGUE', 'COLETE']
                         type_str = "PICKUP" if is_pickup else "DELIVERY"
                         
-                        item_key = f"{material}_{location}_{type_str}"
+                        # Include total in key to distinguish different quantities to same destination (e.g. 29 SCU vs 31 SCU)
+                        # Use Objective ID if available for absolute uniqueness
+                        if objective_id:
+                             item_key = f"{material}_{location}_{type_str}_{total}_{objective_id}"
+                        else:
+                             item_key = f"{material}_{location}_{type_str}_{total}"
                         
-                        is_complete_event = PATTERNS["objective_complete"] in notification_text
+                        is_complete_event = PATTERNS["objective_complete"].lower() in notification_text.lower()
                         status_val = "COMPLETED" if (is_complete_event or (current >= total and total > 0)) else "PENDING"
                         
                         # GLOBAL SEARCH FALLBACK (Smart Match)
@@ -758,52 +840,83 @@ class HaulingMonitor:
                             
                             # 2. Search for FUZZY match if not found
                             if not target_mission_id:
+                                # First pass: Look for PENDING items (Prioritize uncompleted items)
                                 for m_id, m_data in data_store["missions"].items():
                                     for k, v in m_data["items"].items():
-                                        if v["mat"] == material and is_loc_match(v["dest"], location):
+                                        # Check volume match to avoid merging distinct items (e.g. 29 vs 31 SCU)
+                                        if v["mat"] == material and is_loc_match(v["dest"], location) and v.get("status") != "COMPLETED" and v.get("vol") == total:
+                                            if objective_id and objective_id not in k: continue
                                             target_mission_id = m_id
                                             item_key = k # ADOPT EXISTING KEY
-                                            print(f"🔍 Smart Match (Fuzzy): Found item {k} in {m_id}")
+                                            print(f"🔍 Smart Match (Fuzzy - Pending): Found item {k} in {m_id}")
                                             break
                                     if target_mission_id: break
+                                
+                                # Second pass: Look for ANY items (Fallback if all are completed)
+                                if not target_mission_id:
+                                    for m_id, m_data in data_store["missions"].items():
+                                        for k, v in m_data["items"].items():
+                                            if v["mat"] == material and is_loc_match(v["dest"], location) and v.get("vol") == total:
+                                                if objective_id and objective_id not in k: continue
+                                                target_mission_id = m_id
+                                                item_key = k 
+                                                print(f"🔍 Smart Match (Fuzzy - Any): Found item {k} in {m_id}")
+                                                break
+                                        if target_mission_id: break
                         
                         if target_mission_id:
                             # Check if we need to resolve item_key locally (if mission was known but key mismatch)
                             # e.g. "Everus Harbor" vs "Everus Harbor Harbor"
                             if item_key not in data_store["missions"][target_mission_id]["items"]:
                                 for k, v in data_store["missions"][target_mission_id]["items"].items():
-                                    if v["mat"] == material and is_loc_match(v["dest"], location):
+                                    if v["mat"] == material and is_loc_match(v["dest"], location) and v.get("vol") == total:
+                                        # NEW: If we have a specific Objective ID, ensure the existing key matches it
+                                        # This prevents merging distinct items (e.g. 0/4 Waste #1 vs 0/4 Waste #2)
+                                        if objective_id and objective_id not in k:
+                                             continue 
+                                        
                                         print(f"♻️ Key Correction: {item_key} -> {k}")
                                         item_key = k # Adopt existing key to update it
                                         break
 
                             # Update existing mission
-                            # Check for MANUAL_ADD duplicates
-                            keys_to_remove = []
-                            for k, v in data_store["missions"][target_mission_id]["items"].items():
-                                if v.get("action") == "MANUAL_ADD" and v.get("mat") == material and is_loc_match(v.get("dest"), location):
-                                    keys_to_remove.append(k)
-                            
-                            for k in keys_to_remove:
-                                del data_store["missions"][target_mission_id]["items"][k]
-                                print(f"♻️ LOG Replaced Manual Item: {material} -> {location}")
+                            # Check for MANUAL_ADD duplicates - DISABLED to prevent deleting user's manual fixes
+                            # keys_to_remove = []
+                            # for k, v in data_store["missions"][target_mission_id]["items"].items():
+                            #     if v.get("action") == "MANUAL_ADD" and v.get("mat") == material and is_loc_match(v.get("dest"), location):
+                            #         keys_to_remove.append(k)
+                            # 
+                            # for k in keys_to_remove:
+                            #     del data_store["missions"][target_mission_id]["items"][k]
+                            #     print(f"♻️ LOG Replaced Manual Item: {material} -> {location}")
 
-                            data_store["missions"][target_mission_id]["items"][item_key] = {
-                                "mat": material,
-                                "dest": location,
-                                "vol": total,
-                                "delivered": current,
-                                "status": status_val,
-                                "type": type_str,
-                                "action": action
-                            }
-                            print(f"📦 LOG (Native): Item {action} {current}/{total} {material} -> {location} [{status_val}]")
-                            save_state()
+                            # Check Blacklist (Native)
+                            should_process = True
+                            temp_sig_item = { "mat": material, "dest": location, "vol": total, "type": type_str }
+                            sig = get_item_signature(temp_sig_item)
                             
-                            # Check for duplicates via item match
-                            # Only check for duplicates if the mission was NOT explicitly accepted (i.e. it's likely a restored mission)
-                            if not data_store["missions"][target_mission_id].get("explicitly_accepted", False):
-                                self.detect_and_merge_duplicate(target_mission_id, data_store["missions"][target_mission_id]["items"][item_key])
+                            if "ignored_signatures" in data_store and sig in data_store["ignored_signatures"]:
+                                if item_key not in data_store["missions"][target_mission_id]["items"]:
+                                    print(f"🚫 Ignored Deleted Item (Native): {material} -> {location}")
+                                    should_process = False
+                            
+                            if should_process:
+                                data_store["missions"][target_mission_id]["items"][item_key] = {
+                                    "mat": material,
+                                    "dest": location,
+                                    "vol": total,
+                                    "delivered": current,
+                                    "status": status_val,
+                                    "type": type_str,
+                                    "action": action
+                                }
+                                print(f"📦 LOG (Native): Item {action} {current}/{total} {material} -> {location} [{status_val}]")
+                                save_state()
+                                
+                                # Check for duplicates via item match
+                                # Only check for duplicates if the mission was NOT explicitly accepted (i.e. it's likely a restored mission)
+                                if not data_store["missions"][target_mission_id].get("explicitly_accepted", False):
+                                    self.detect_and_merge_duplicate(target_mission_id, data_store["missions"][target_mission_id]["items"][item_key])
 
                         else:
                             # No Mission ID and No Smart Match -> Fallback to UI Logic (likely handled by UpdateNotificationItem later)
@@ -817,6 +930,7 @@ class HaulingMonitor:
                         # 2. Try Generic/Non-SCU Regex
                         # (Keep existing logic for generic regex, but also add Smart Match support if needed)
                         # For brevity, leaving as is for now unless requested.
+                        print(f"⚠️ LOG (Native): Failed to parse Objective details: {notification_text}")
                         pass
 
             # --- DEBUG: MISSING INFO FROM NOTIFICATIONS ---
@@ -895,6 +1009,11 @@ class HaulingMonitor:
         # Handle "Contract Accepted" and "New Objective" from UI notifications (when backend MissionId is missing)
         # Format: <UpdateNotificationItem> Notification "Text..." [ID], Action: ...
         if PATTERNS["ui_notif_event"] in line and PATTERNS["ui_notif_tag"] in line:
+            # USER REQUEST: Only process "Action: StartFade" events to ensure stability and avoid 3x duplication
+            # The log registers 3x (Added, StartFade, Remove). StartFade is the most reliable "fix" point.
+            if "Action: StartFade" not in line:
+                return
+
             # Extract Notification ID to avoid duplicates (StartFade, Remove, etc.)
             notif_id_match = re.search(PATTERNS["ui_notif_id_regex"], line)
             if notif_id_match:
@@ -978,39 +1097,49 @@ class HaulingMonitor:
                     
                     item_key = f"{material}_{location}_{type_str}"
                     
-                    # Check for MANUAL_ADD duplicates and remove them
-                    keys_to_remove = []
-                    if m_id in data_store["missions"]:
-                        for k, v in data_store["missions"][m_id]["items"].items():
-                            if v.get("action") == "MANUAL_ADD" and v.get("mat") == material and v.get("dest") == location:
-                                keys_to_remove.append(k)
-                        
-                        for k in keys_to_remove:
-                            del data_store["missions"][m_id]["items"][k]
-                            print(f"♻️ {T('log_replaced', 'log')}: {material} -> {location}")
+                    # Check for MANUAL_ADD duplicates - DISABLED
+                    # keys_to_remove = []
+                    # if m_id in data_store["missions"]:
+                    #     for k, v in data_store["missions"][m_id]["items"].items():
+                    #         if v.get("action") == "MANUAL_ADD" and v.get("mat") == material and v.get("dest") == location:
+                    #             keys_to_remove.append(k)
+                    #     
+                    #     for k in keys_to_remove:
+                    #         del data_store["missions"][m_id]["items"][k]
+                    #         print(f"♻️ {T('log_replaced', 'log')}: {material} -> {location}")
                     
                     is_complete_event = PATTERNS["objective_complete"] in line
                     
                     # Logic: If it is "Objective Complete", FORCE status=COMPLETED
                     status_val = "COMPLETED" if (is_complete_event or (current >= total and total > 0)) else "PENDING"
 
-                    data_store["missions"][m_id]["items"][item_key] = {
-                        "mat": material,
-                        "dest": location,
-                        "vol": total,
-                        "delivered": current,
-                        "status": status_val,
-                        "type": type_str,
-                        "action": action
-                    }
-                    print(f"📦 {T('source_log_ui', 'ui')}: {T('item_log', 'log')} {action} {current}/{total} {material} -> {location} [{status_val}]")
-                    save_state()
+                    # Check Blacklist (UI)
+                    should_process = True
+                    temp_sig_item = { "mat": material, "dest": location, "vol": total, "type": type_str }
+                    sig = get_item_signature(temp_sig_item)
+                    if "ignored_signatures" in data_store and sig in data_store["ignored_signatures"]:
+                        if item_key not in data_store["missions"][m_id]["items"]:
+                            print(f"🚫 Ignored Deleted Item (UI): {material} -> {location}")
+                            should_process = False
 
-                    # Check for duplicates via item match
-                    if m_id in data_store["missions"] and item_key in data_store["missions"][m_id]["items"]:
-                        # Only check for duplicates if the mission was NOT explicitly accepted (i.e. it's likely a restored mission)
-                        if not data_store["missions"][m_id].get("explicitly_accepted", False):
-                            self.detect_and_merge_duplicate(m_id, data_store["missions"][m_id]["items"][item_key])
+                    if should_process:
+                        data_store["missions"][m_id]["items"][item_key] = {
+                            "mat": material,
+                            "dest": location,
+                            "vol": total,
+                            "delivered": current,
+                            "status": status_val,
+                            "type": type_str,
+                            "action": action
+                        }
+                        print(f"📦 {T('source_log_ui', 'ui')}: {T('item_log', 'log')} {action} {current}/{total} {material} -> {location} [{status_val}]")
+                        save_state()
+
+                        # Check for duplicates via item match
+                        if m_id in data_store["missions"] and item_key in data_store["missions"][m_id]["items"]:
+                            # Only check for duplicates if the mission was NOT explicitly accepted (i.e. it's likely a restored mission)
+                            if not data_store["missions"][m_id].get("explicitly_accepted", False):
+                                self.detect_and_merge_duplicate(m_id, data_store["missions"][m_id]["items"][item_key])
 
         # 1. IDENTITY DETECTION
         chat_match = re.search(r"joined channel '(.+?) : (.+?)'", line)
@@ -1043,7 +1172,8 @@ class HaulingMonitor:
 
         # 3. MISSION START (Contract Accepted)
         # <SHUDEvent_OnNotification> Added notification "Contract Accepted: Title..." ... MissionId: [ID]
-        if PATTERNS["contract_accepted"] in line and PATTERNS["mission_id_tag"] in line:
+        # EXCLUDE: SHUDEvent lines (handled by Block 1)
+        if PATTERNS["contract_accepted"] in line and PATTERNS["mission_id_tag"] in line and PATTERNS["notification_event"] not in line:
             id_match = re.search(PATTERNS["mission_id_regex"], line)
             title_match = re.search(PATTERNS["contract_accepted_regex"], line)
             
@@ -1071,7 +1201,14 @@ class HaulingMonitor:
 
         # 4. MISSION OBJECTIVE (Cargo Details)
         # "New Objective: Deliver 0/9 SCU of Silicon to HDPC-Farnesway: " ... MissionId: [ID]
-        if (PATTERNS["new_objective"] in line or PATTERNS["objective_complete"] in line) and PATTERNS["mission_id_tag"] in line:
+        if (
+            PATTERNS["new_objective"] in line or 
+            PATTERNS["objective_complete"] in line or
+            "Novo Objetivo" in line or
+            "Novo objetivo" in line or
+            "Objetivo Completo" in line or
+            "Objetivo completo" in line
+        ) and PATTERNS["mission_id_tag"] in line and PATTERNS["notification_event"] not in line:
             id_match = re.search(PATTERNS["mission_id_regex"], line)
             
             # Regex for cargo details (English)
@@ -1123,7 +1260,7 @@ class HaulingMonitor:
                 keys_to_remove = []
                 if m_id in data_store["missions"]:
                     for k, v in data_store["missions"][m_id]["items"].items():
-                        if v.get("action") == "MANUAL_ADD" and v.get("mat") == material and v.get("dest") == location:
+                        if v.get("action") == "MANUAL_ADD" and is_material_match(v.get("mat"), material) and v.get("dest") == location:
                             keys_to_remove.append(k)
                     
                     for k in keys_to_remove:
@@ -1249,6 +1386,16 @@ class HaulingMonitor:
                 data_store["notif_mission_map"][nid] = mid
         
         if "aUEC" in line:
+            # DEDUPLICATION: Check for Notification ID in the line (e.g. [15])
+            # This prevents double-counting when the log dumps the notification queue
+            notif_id_match = re.search(r'\[(\d+)\]', line)
+            if notif_id_match:
+                nid = notif_id_match.group(1)
+                if nid in self.processed_reward_ids:
+                    # print(f"🚫 Duplicate Reward Ignored (ID: {nid})")
+                    return False
+                self.processed_reward_ids.add(nid)
+
             reward_match = re.search(PATTERNS["reward_regex"], line)
             if reward_match:
                 amount = int(reward_match.group(1))
@@ -1371,21 +1518,18 @@ def background_log_reader():
     print(f"📖 {T('monitoring', 'log')}: {LOG_PATH}")
     
     with open(LOG_PATH, "r", encoding="utf-8", errors="ignore") as f:
-        # Ler os últimos 5MB para capturar missões já aceitas
+        # Ler os últimos 10MB para garantir leitura do dia todo
         f.seek(0, 2)
         size = f.tell()
-        # Reduce buffer to 2MB to avoid reading too far back if user has huge log
-        # But user might have mission accepted 3h ago. 
-        # Better: Read 5MB but filter by timestamp.
-        start_pos = max(0, size - 5 * 1024 * 1024)
+        start_pos = max(0, size - 10 * 1024 * 1024)
         f.seek(start_pos)
         print(f"✓ {T('reading_history', 'log')}")
         
         # Regex for timestamp: <2025-01-01T15:00:00.000Z>
         ts_regex = re.compile(r'<(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})')
         
-        # Calculate cutoff time (e.g. 12 hours ago)
-        cutoff_time = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=12)
+        # Calculate cutoff time (24 hours ago)
+        cutoff_time = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=24)
 
         while True:
             line = f.readline()
@@ -1395,8 +1539,6 @@ def background_log_reader():
                 continue
             
             # Timestamp Check for History Reading
-            # Only apply if we are "catching up" (though we don't strictly know if we are catching up or live)
-            # But filtering old lines is generally safe if they are > 12h old.
             ts_match = ts_regex.match(line)
             if ts_match:
                 try:
@@ -1406,7 +1548,12 @@ def background_log_reader():
                 except:
                     pass
 
-            monitor.process_line(line)
+            try:
+                monitor.process_line(line)
+            except Exception as e:
+                print(f"❌ ERROR processing line: {line.strip()}")
+                traceback.print_exc()
+
 
 
 
@@ -1569,6 +1716,13 @@ def delete_history(history_index):
 @app.route('/delete_mission/<mission_id>')
 def delete_mission(mission_id):
     if mission_id in data_store["missions"]:
+        # BLACKLIST ITEMS (Prevent Resurrection)
+        if "ignored_signatures" not in data_store: data_store["ignored_signatures"] = []
+        for k, v in data_store["missions"][mission_id]["items"].items():
+             sig = get_item_signature(v)
+             if sig not in data_store["ignored_signatures"]:
+                 data_store["ignored_signatures"].append(sig)
+
         del data_store["missions"][mission_id]
         print(f"🗑️ {T('manual_delete', 'log')}: {T('mission', 'ui')} {mission_id}")
         save_state()
@@ -2077,6 +2231,32 @@ def update_container_size():
         
     return '<meta http-equiv="refresh" content="0;url=/">'
 
+@app.route('/delete_item', methods=['POST'])
+def delete_item():
+    m_id = request.form.get('mission_id')
+    i_key = request.form.get('item_key')
+    
+    if m_id and i_key and m_id in data_store["missions"]:
+        if i_key in data_store["missions"][m_id]["items"]:
+            # BLACKLIST ITEM (Prevent Resurrection)
+            item = data_store["missions"][m_id]["items"][i_key]
+            sig = get_item_signature(item)
+            if "ignored_signatures" not in data_store: data_store["ignored_signatures"] = []
+            if sig not in data_store["ignored_signatures"]:
+                data_store["ignored_signatures"].append(sig)
+
+            del data_store["missions"][m_id]["items"][i_key]
+            print(f"🗑️ {T('manual_delete', 'log')}: Item {i_key} ({m_id})")
+            
+            # Clean up mission if empty
+            if not data_store["missions"][m_id]["items"]:
+                del data_store["missions"][m_id]
+                print(f"🗑️ {T('manual_delete', 'log')}: Mission {m_id} (Empty)")
+                
+            save_state()
+            
+    return '<meta http-equiv="refresh" content="0;url=/">'
+
 @app.route('/')
 def index():
     # AGGREGATION LOGIC
@@ -2107,7 +2287,7 @@ def index():
         # Get max container size for this mission (default 32)
         mission_max_size = m_data.get("max_container_size", 32)
         
-        for item in m_data["items"].values():
+        for item_key, item in m_data["items"].items():
             d, m, v, status = item["dest"], item["mat"], item["vol"], item["status"]
             delivered = item.get("delivered", 0)
             i_type = item.get("type", "DELIVERY") # PICKUP or DELIVERY
@@ -2126,12 +2306,19 @@ def index():
                     "delivered_pickup": 0,
                     "delivered_delivery": 0,
                     "mission_ids": set(),
+                    "items_list": [], # Store all items for detailed view
                     "all_items_completed": True,
                     "all_pickups_completed": True,
                     "max_size": item_max_size # Store preference
                 }
             
             summary[d][m]["mission_ids"].add(m_id)
+            summary[d][m]["items_list"].append({
+                "mid": m_id,
+                "key": item_key,
+                "data": item,
+                "source": m_data.get("source", "Unknown")
+            })
             
             # Check individual item completion
             # REFINED LOGIC: Pickup items do NOT block mission completion.
@@ -2299,38 +2486,62 @@ def index():
                     if p_done and not is_completed:
                          p_style_class = " COMPLETED" # Re-use completed style for green border/text
                     
-                    # Manual Update Form (Hidden by default, toggled via badge click)
-                    # We need a unique ID for each item. Since aggregated, we pick the first one from mission_ids/items
-                    # BUT 'summary' aggregates by destination+material. There might be multiple missions contributing.
-                    # Simplification: Allow updating the FIRST matching item found.
+                    # Manual Update Form for Pickup
+                    pickup_items_list = [x for x in data["items_list"] if x["data"].get("type") == "PICKUP"]
                     
-                    # Find a representative item key and mission id for the manual update
-                    rep_mid = next(iter(data["mission_ids"])) if data["mission_ids"] else None
-                    rep_key = None
-                    if rep_mid:
-                         for k, v in data_store["missions"][rep_mid]["items"].items():
-                              if v["mat"] == m and v["dest"] == d and v["type"] == "PICKUP":
-                                   rep_key = k
-                                   break
-                    
-                    if rep_mid and rep_key:
+                    if pickup_items_list:
+                         # Create unique ID for this group modal
+                         group_id = f"pick_{hashlib.md5((d + m).encode()).hexdigest()[:8]}"
+                         
                          badges += f"""
-                         <span class='scu-box pickup-tag{p_style_class}' style='cursor:pointer; {mat_style}' onclick="toggleItemEdit('{rep_mid}_{rep_key}')" title="{T('click_to_edit', 'ui', 'Click to edit quantity')}">
-                              {prefix}{T('pickup')}: {vol_display}
+                         <span class='scu-box pickup-tag{p_style_class}' style='cursor:pointer; {mat_style}' onclick="toggleItemEdit('{group_id}')" title="{T('click_to_edit', 'ui', 'Click to edit quantity')}">
+                              {prefix}{T('pickup')}: {vol_display} <small>✏️</small>
                          </span>
-                         <div id="item_edit_{rep_mid}_{rep_key}" style="display:none; position:absolute; background:#111; border:1px solid #444; padding:5px; z-index:100;">
-                              <form action="/force_complete_item" method="post" style="display:flex; flex-direction:column; gap:5px;">
-                                   <input type="hidden" name="mission_id" value="{rep_mid}">
-                                   <input type="hidden" name="item_key" value="{rep_key}">
-                                   <div style="display:flex; align-items:center; gap:5px;">
-                                       <span style="color:#aaa; font-size:0.8rem;">Qty:</span>
-                                       <input type="number" name="delivered_qty" value="{p_current}" style="width:60px; background:#222; color:#fff; border:1px solid #333;" min="0" max="{p_vol}">
-                                   </div>
-                                   <div style="display:flex; gap:5px; justify-content:flex-end;">
-                                       <button type="submit" style="background:#00f2ff; color:#000; border:none; cursor:pointer; padding:2px 8px; border-radius:3px;">💾 {T('save', 'ui', 'Save')}</button>
-                                       <button type="button" onclick="closeEdit(this)" style="background:#333; color:#fff; border:none; cursor:pointer; padding:2px 8px; border-radius:3px;">X</button>
-                                   </div>
-                              </form>
+                         <div id="item_edit_{group_id}" style="display:none; position:absolute; background:#111; border:1px solid #444; padding:10px; z-index:100; min-width:250px; box-shadow: 0 4px 8px rgba(0,0,0,0.5);">
+                              <div style="margin-bottom:10px; font-weight:bold; border-bottom:1px solid #333; padding-bottom:5px; font-size:0.9rem;">{T('manage_items', 'ui', 'Manage Items')} ({m})</div>
+                         """
+                         
+                         for item_entry in pickup_items_list:
+                             imid = item_entry["mid"]
+                             ikey = item_entry["key"]
+                             idata = item_entry["data"]
+                             isrc = item_entry["source"]
+                             icurr = idata.get("delivered", 0)
+                             ivol = idata.get("vol", 0)
+                             istatus = idata.get("status", "PENDING")
+                             status_icon = "✅" if istatus == "COMPLETED" else "⏳"
+                             
+                              # Only show delete button for MANUAL items
+                             del_btn_html = ""
+                             if idata.get("action") == "MANUAL_ADD":
+                                 del_btn_html = f"""
+                                     <form action="/delete_item" method="post" onsubmit="return confirm('{T('delete_item_confirm')}')" style="display:inline;">
+                                         <input type="hidden" name="mission_id" value="{imid}">
+                                         <input type="hidden" name="item_key" value="{ikey}">
+                                         <button type="submit" style="background:none; border:none; color:#ff5555; cursor:pointer; font-size:0.7rem; padding:0;">🗑️ {T('delete', 'ui', 'Delete')}</button>
+                                     </form>
+                                 """
+                             
+                             badges += f"""
+                             <div style="margin-bottom:8px; background:#1a1a0a; padding:5px; border:1px solid #333; border-radius:3px;">
+                                 <div style="font-size:0.7rem; color:#666; display:flex; justify-content:space-between; margin-bottom:4px;">
+                                     <span>{status_icon} {isrc}</span>
+                                     {del_btn_html}
+                                 </div>
+                                 <form action="/force_complete_item" method="post" style="display:flex; align-items:center; gap:5px;">
+                                     <input type="hidden" name="mission_id" value="{imid}">
+                                     <input type="hidden" name="item_key" value="{ikey}">
+                                     <input type="number" name="delivered_qty" value="{icurr}" style="width:50px; background:#222; color:#fff; border:1px solid #333; font-size:0.8rem;" min="0" max="{ivol}">
+                                     <span style="color:#888; font-size:0.8rem;">/ {ivol}</span>
+                                     <button type="submit" style="background:#00f2ff; color:#000; border:none; cursor:pointer; padding:2px 6px; border-radius:3px; margin-left:auto; font-size:0.8rem;">💾</button>
+                                 </form>
+                             </div>
+                             """
+                             
+                         badges += f"""
+                              <div style="text-align:right; margin-top:5px;">
+                                  <button type="button" onclick="closeEdit(this)" style="background:#333; color:#fff; border:none; cursor:pointer; padding:3px 10px; border-radius:3px;">{T('close', 'ui', 'Close')}</button>
+                              </div>
                          </div>
                          """
                     else:
@@ -2355,36 +2566,63 @@ def index():
                          d_style_class = " COMPLETED"
 
                     # Manual Update Form for Delivery
-                    rep_mid = next(iter(data["mission_ids"])) if data["mission_ids"] else None
-                    rep_key = None
-                    if rep_mid:
-                         for k, v in data_store["missions"][rep_mid]["items"].items():
-                              if v["mat"] == m and v["dest"] == d and v["type"] != "PICKUP":
-                                   rep_key = k
-                                   break
+                    delivery_items = [x for x in data["items_list"] if x["data"].get("type") != "PICKUP"]
                     
-                    if rep_mid and rep_key:
+                    if delivery_items:
+                         # Create unique ID for this group modal
+                         group_id = f"del_{hashlib.md5((d + m).encode()).hexdigest()[:8]}"
+                         
                          badges += f"""
-                         <span class='scu-box deliver-tag{d_style_class}' style='cursor:pointer; {mat_style}' onclick="toggleItemEdit('{rep_mid}_{rep_key}')" title="{T('click_to_edit', 'ui', 'Click to edit quantity')}">
+                         <span class='scu-box deliver-tag{d_style_class}' style='cursor:pointer; {mat_style}' onclick="toggleItemEdit('{group_id}')" title="{T('click_to_edit', 'ui', 'Click to edit quantity')}">
                               {prefix}{label}: {vol_display} <small>✏️</small>
                          </span>
-                         <div id="item_edit_{rep_mid}_{rep_key}" style="display:none; position:absolute; background:#111; border:1px solid #444; padding:5px; z-index:100;">
-                              <form action="/force_complete_item" method="post" style="display:flex; flex-direction:column; gap:5px;">
-                                   <input type="hidden" name="mission_id" value="{rep_mid}">
-                                   <input type="hidden" name="item_key" value="{rep_key}">
-                                   <div style="display:flex; align-items:center; gap:5px;">
-                                       <span style="color:#aaa; font-size:0.8rem;">Qty:</span>
-                                       <input type="number" name="delivered_qty" value="{d_current}" style="width:60px; background:#222; color:#fff; border:1px solid #333;" min="0" max="{d_vol}">
-                                   </div>
-                                   <div style="display:flex; align-items:center; gap:5px;">
-                                       <span style="color:#aaa; font-size:0.8rem;">aUEC:</span>
-                                       <input type="number" name="value" placeholder="Reward" style="width:60px; background:#222; color:#ffd700; border:1px solid #333;">
-                                   </div>
-                                   <div style="display:flex; gap:5px; justify-content:flex-end;">
-                                       <button type="submit" style="background:#00f2ff; color:#000; border:none; cursor:pointer; padding:2px 8px; border-radius:3px;">💾 {T('save', 'ui', 'Save')}</button>
-                                       <button type="button" onclick="closeEdit(this)" style="background:#333; color:#fff; border:none; cursor:pointer; padding:2px 8px; border-radius:3px;">X</button>
-                                   </div>
-                              </form>
+                         <div id="item_edit_{group_id}" style="display:none; position:absolute; background:#111; border:1px solid #444; padding:10px; z-index:100; min-width:250px; box-shadow: 0 4px 8px rgba(0,0,0,0.5);">
+                              <div style="margin-bottom:10px; font-weight:bold; border-bottom:1px solid #333; padding-bottom:5px; font-size:0.9rem;">{T('manage_items', 'ui', 'Manage Items')} ({m})</div>
+                         """
+                         
+                         for item_entry in delivery_items:
+                             imid = item_entry["mid"]
+                             ikey = item_entry["key"]
+                             idata = item_entry["data"]
+                             isrc = item_entry["source"]
+                             icurr = idata.get("delivered", 0)
+                             ivol = idata.get("vol", 0)
+                             istatus = idata.get("status", "PENDING")
+                             status_icon = "✅" if istatus == "COMPLETED" else "⏳"
+                             
+                              # Only show delete button for MANUAL items
+                             del_btn_html = ""
+                             if idata.get("action") == "MANUAL_ADD":
+                                 del_btn_html = f"""
+                                     <form action="/delete_item" method="post" onsubmit="return confirm('{T('delete_item_confirm')}')" style="display:inline;">
+                                         <input type="hidden" name="mission_id" value="{imid}">
+                                         <input type="hidden" name="item_key" value="{ikey}">
+                                         <button type="submit" style="background:none; border:none; color:#ff5555; cursor:pointer; font-size:0.7rem; padding:0;">🗑️ {T('delete', 'ui', 'Delete')}</button>
+                                     </form>
+                                 """
+                             
+                             badges += f"""
+                             <div style="margin-bottom:8px; background:#1a1a0a; padding:5px; border:1px solid #333; border-radius:3px;">
+                                 <div style="font-size:0.7rem; color:#666; display:flex; justify-content:space-between; margin-bottom:4px;">
+                                     <span>{status_icon} {isrc}</span>
+                                     {del_btn_html}
+                                 </div>
+                                 <form action="/force_complete_item" method="post" style="display:flex; align-items:center; gap:5px;">
+                                    <input type="hidden" name="mission_id" value="{imid}">
+                                    <input type="hidden" name="item_key" value="{ikey}">
+                                    
+                                    <input type="number" name="delivered_qty" value="{icurr}" style="width:50px; background:#222; color:#fff; border:1px solid #333; font-size:0.8rem;" min="0" max="{ivol}">
+                                    <span style="color:#888; font-size:0.8rem;">/ {ivol}</span>
+                                    
+                                    <button type="submit" style="background:#00f2ff; color:#000; border:none; cursor:pointer; padding:2px 6px; border-radius:3px; margin-left:auto; font-size:0.8rem;">💾</button>
+                                 </form>
+                             </div>
+                             """
+                             
+                         badges += f"""
+                              <div style="text-align:right; margin-top:5px;">
+                                  <button type="button" onclick="closeEdit(this)" style="background:#333; color:#fff; border:none; cursor:pointer; padding:4px 10px; border-radius:3px; font-size:0.8rem;">{T('close', 'ui', 'Close')}</button>
+                              </div>
                          </div>
                          """
                     else:
@@ -2434,9 +2672,27 @@ def index():
                 
                 # Render buttons for each linked mission
                 if "mission_ids" in data:
+                    html += "<div style='display:flex; gap:10px; margin-left:10px;'>"
                     for mid in data["mission_ids"]:
-                         html += f"<button onclick='toggleEdit(\"{mid}\")' style='background:none; border:1px solid #444; color:#888; cursor:pointer; padding:2px 6px; border-radius:3px; font-size:0.8rem;' title='Add items'>➕</button>"
-                         html += f" <a href='/delete_mission/{mid}' onclick=\"return confirm('{T('delete_confirm')}')\" style='text-decoration:none; border:1px solid #663333; color:#cc5555; padding:2px 6px; border-radius:3px; font-size:0.8rem; margin-left:5px;' title='Delete Mission'>🗑️</a>"
+                         html += f"<button onclick='toggleEdit(\"{mid}\")' style='background:none; border:1px solid #444; color:#00f2ff; cursor:pointer; padding:2px 8px; border-radius:3px; font-size:0.8rem;' title='{T('add_items_title')}'>➕</button>"
+                         
+                         # Find specific item info for this mission in this group to allow granular delete
+                         target_item = next((x for x in data["items_list"] if x["mid"] == mid), None)
+                         if target_item:
+                             ikey_del = target_item["key"]
+                             is_manual = target_item["data"].get("action") == "MANUAL_ADD"
+                             # Use delete_item route for safer deletion (only deletes mission if empty)
+                             html += f"""
+                             <form action="/delete_item" method="post" onsubmit="return confirm('{T('delete_item_confirm') if is_manual else T('delete_confirm')}')" style="display:flex; align-items:center;">
+                                <input type="hidden" name="mission_id" value="{mid}">
+                                <input type="hidden" name="item_key" value="{ikey_del}">
+                                <button type="submit" style="background:none; border:1px solid #444; color:#666; cursor:pointer; padding:2px 8px; border-radius:3px; font-size:0.8rem; display:flex; align-items:center;" title="{T('delete', 'ui', 'Delete')}">🗑️</button>
+                             </form>
+                             """
+                         else:
+                             # Fallback (should not happen)
+                             html += f" <a href='/delete_mission/{mid}' onclick=\"return confirm('{T('delete_confirm')}')\" style='text-decoration:none; border:1px solid #444; color:#666; padding:2px 8px; border-radius:3px; font-size:0.8rem; display:flex; align-items:center;' title='Delete Mission'>🗑️</a>"
+                    html += "</div>"
                 
                 html += "</div></div>"
                 
