@@ -1,15 +1,16 @@
 {
   "contract_accepted": "Contrato Aceito",
-  "contract_accepted_regex": "(?:Contrato Aceito|Contrato aceito):\\s*(.+?)(?::|\\\"|\\[|$)",
+  "contract_accepted_regex": "(?:Contrato Aceito|CONTRATO ACEITO):\\s*(.+?)(?::|\\\"|\\[|$)",
   "contract_canceled": "Contrato Cancelado",
   "contract_abandoned": "Contrato Abandonado",
   "contract_failed": "Contrato Falhou",
   "new_objective": "Novo Objetivo",
-  "objective_complete": "Objetivo Completo",
-  "contract_complete": "Contrato Concluído",
-  "contract_complete_regex": "(?:Contrato Concluído|Contrato Completo):\\s*(.+?)(?::|\\\"|\\[|$)",
+  "objective_complete": "OBJETIVO CONCLU",
+  "contract_complete": "CONTRATO CONCLU",
+  "contract_complete_regex": "(?:Contrato Concluído|Contrato Completo|CONTRATO CONCLUÍDO|CONTRATO CONCLUÃDO):\\s*(.+?)(?::|\\\"|\\[|$)",
   "contract_ended_regex": "(?:Contrato)\\s*(?:Cancelado|Abandonado|Falhou|Reprovado):\\s*(.+?)(?::|\\\"|\\[|$)",
-  "reward_regex": "Recebido\\s+(\\d+)\\s+aUEC",
-  "scu_regex": "(Deliver|Pickup|Dropoff|Transport|Collect|Entregar|Coletar|Pegar|Transportar|Entregue|Pegue|Colete)\\s+(\\d+)(?:[/\\s]+(\\d+))?\\s+SCU\\s+(?:of|de)?\\s*([A-Za-z0-9\\s\\(\\)\\-\\.]+?)\\s+(?:to|at|for|towards|para|em|de|a|na|no)\\s+([A-Za-z0-9\\s\\(\\)\\-\\.]+?)(?::|\\\"|\\[|<)",
-  "generic_regex": "(Deliver|Pickup|Collect|Entregar|Coletar|Pegar|Entregue|Pegue|Colete)\\s+(.+?)\\s+(?:to|at|from|para|de|em|na|no)\\s+([A-Za-z0-9\\s\\-\\.]+?)(?::|\\\"|\\[|$)"
+  "reward_regex": "(?:Recebido|Premiado)\\s+(\\d+)\\s+aUEC",
+  "scu_regex": "(Entregar|Coletar|Pegar|Transportar|Deixar|Entregue|Pegue|Colete)\\s+(\\d+)(?:[/\\s]+(\\d+))?\\s+SCU\\s+(?:de|of)?\\s*(.+?)\\s+(?:para|em|de|to|at)\\s+(.+?)(?::|\\\"|\\[|<|$)",
+  "notif_text_regex": "Added notification \"(.+?)(?:\"|$)",
+  "generic_regex": "(Entregar|Coletar|Pegar|Entregue|Pegue|Colete)\\s+(.+?)\\s+(?:para|em|de|to|at)\\s+(.+?)(?::|\\\"|\\[|$)"
 }
